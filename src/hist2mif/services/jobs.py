@@ -26,6 +26,9 @@ DEFAULT_CLI_BATCH_SIZE = 128
 DEFAULT_CLI_NUM_WORKERS = 4
 DEFAULT_CLI_PIN_MEMORY = True
 
+# CLI snapshot is written at 1/SNAPSHOT_STEP of the full-resolution composite.
+SNAPSHOT_STEP = 20
+
 _model: object | None = None
 _model_device: object | None = None
 _model_lock = threading.Lock()
@@ -150,7 +153,7 @@ def run_inference_to_tif_and_snapshot(
     pin_memory: bool = DEFAULT_CLI_PIN_MEMORY,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> dict:
-    """Stream full-resolution TIFF inference and write a 1/10 PNG snapshot."""
+    """Stream full-resolution TIFF inference and write a 1/SNAPSHOT_STEP PNG snapshot."""
     if mag not in inference.MAG_INPUT_SIZE:
         raise ValueError(f"Unknown magnification: {mag}")
     if batch_size <= 0:
@@ -176,7 +179,10 @@ def run_inference_to_tif_and_snapshot(
         photometric="rgb",
         bigtiff=True,
     )
-    snapshot = np.zeros(((h + 9) // 10, (w + 9) // 10, 3), dtype=np.uint8)
+    snapshot = np.zeros(
+        ((h + SNAPSHOT_STEP - 1) // SNAPSHOT_STEP, (w + SNAPSHOT_STEP - 1) // SNAPSHOT_STEP, 3),
+        dtype=np.uint8,
+    )
 
     dataset = _TiffTileDataset(src_path, h, w, tile_size)
     loader = DataLoader(
@@ -229,7 +235,7 @@ def run_inference_to_tif_and_snapshot(
         "window_size": inference.WINDOW,
         "grid": [nh, nw],
         "image_hw": [h, w],
-        "snapshot_scale": 0.1,
+        "snapshot_scale": 1.0 / SNAPSHOT_STEP,
         "batch_size": batch_size,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
@@ -278,13 +284,13 @@ def _write_snapshot_region(
     ph, pw = comp.shape[:2]
     ys = np.arange(y0, y0 + ph)
     xs = np.arange(x0, x0 + pw)
-    keep_y = ys[ys % 10 == 0]
-    keep_x = xs[xs % 10 == 0]
+    keep_y = ys[ys % SNAPSHOT_STEP == 0]
+    keep_x = xs[xs % SNAPSHOT_STEP == 0]
     if keep_y.size == 0 or keep_x.size == 0:
         return
     tile_y = keep_y - y0
     tile_x = keep_x - x0
-    snapshot[np.ix_(keep_y // 10, keep_x // 10)] = comp[np.ix_(tile_y, tile_x)]
+    snapshot[np.ix_(keep_y // SNAPSHOT_STEP, keep_x // SNAPSHOT_STEP)] = comp[np.ix_(tile_y, tile_x)]
 
 
 def _run_job_worker(job_id: str, saved_input: Path, mag: str) -> None:

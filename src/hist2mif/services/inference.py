@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import colorsys
 import math
 import os
 from pathlib import Path
@@ -22,7 +21,7 @@ from albumentations.core.composition import Compose
 from huggingface_hub import snapshot_download
 from PIL import Image
 
-from hist2mif.domain.channels import EXPORT_CHANNELS
+from hist2mif.domain.channels import EXPORT_CHANNELS, export_channel_colors_u8
 from hist2mif.models.gigatime import gigatime
 
 NUM_CLASSES = 23
@@ -85,23 +84,22 @@ def get_device() -> torch.device:
     return assert_cuda_runtime_ok()
 
 
-def _build_distinct_palette(n: int) -> npt.NDArray[np.float32]:
-    """HSV-spread RGB palette in [0,1], shape (n, 3)."""
-    cols = []
-    for i in range(n):
-        h = (i + 0.35) / max(n, 1)
-        s = float(0.78 + 0.06 * ((i % 4) / 3.0))
-        v = float(0.82 + 0.12 * ((i % 3) / 2.0))
-        r, g, b = colorsys.hsv_to_rgb(h % 1.0, s, v)
-        cols.append([r, g, b])
-    return np.asarray(cols, dtype=np.float32)
-
-
 def get_export_palette() -> npt.NDArray[np.float32]:
-    """One RGB color per exported channel (same order as EXPORT_CHANNELS)."""
+    """One RGB color per exported channel (same order as EXPORT_CHANNELS).
+
+    Colors are sourced from the GigaTIME paper legend (see
+    `hist2mif.domain.channels.CHANNEL_COLORS_RGB`) so the composite snapshot
+    matches the reference figure rather than a synthetic HSV spread.
+    """
     global _PALETTE_21
     if _PALETTE_21 is None:
-        _PALETTE_21 = _build_distinct_palette(len(EXPORT_CHANNELS))
+        colors_u8 = np.asarray(export_channel_colors_u8(), dtype=np.float32)
+        if colors_u8.shape != (len(EXPORT_CHANNELS), 3):
+            raise RuntimeError(
+                f"Export palette shape mismatch: got {colors_u8.shape}, "
+                f"expected ({len(EXPORT_CHANNELS)}, 3)"
+            )
+        _PALETTE_21 = colors_u8 / 255.0
     return _PALETTE_21
 
 

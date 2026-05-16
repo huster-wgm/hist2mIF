@@ -16,7 +16,7 @@ def _default_snapshot_png_path(input_path: Path) -> Path:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    from hist2mif.services.jobs import DEFAULT_CLI_BATCH_SIZE, DEFAULT_CLI_NUM_WORKERS
+    from hist2mif.services.jobs import DEFAULT_CLI_BATCH_SIZE, DEFAULT_CLI_NUM_WORKERS, SNAPSHOT_STEP
 
     parser = argparse.ArgumentParser(
         prog="hist2mif-cli",
@@ -37,7 +37,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--snapshot-png",
         type=Path,
-        help="1/10 scale PNG snapshot path (default: *_virtual_mIF_snapshot.png)",
+        help=f"1/{SNAPSHOT_STEP} scale PNG snapshot path (default: *_virtual_mIF_snapshot.png)",
     )
     parser.add_argument(
         "--batch-size",
