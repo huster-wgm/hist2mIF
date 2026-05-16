@@ -110,15 +110,26 @@ def composite_virtual_mif_rgb_u8(
 ) -> npt.NDArray[np.uint8]:
     """Blend exported marker probabilities into one RGB image (H, W, 3) uint8.
 
-    Uses additive mixing with channel-specific palette colors; intensities are globally rescaled to [0,255].
+    Each pixel's R/G/B is the per-channel max of ``prob[c] * color[c]``.
+    Additive blending across 21 channels saturates almost every tissue
+    pixel to white whenever multiple markers fire with moderate probability;
+    max blending keeps the result inside [0, 1] and preserves the dominant
+    marker's color, which matches typical virtual-mIF visualizations.
+
     Background channels TRITC/Cy5 are excluded via EXPORT_CHANNELS.
     """
     if probs23_hw.shape[0] != NUM_CLASSES:
         raise ValueError(f"Expected {NUM_CLASSES} channels, got {probs23_hw.shape[0]}")
     idxs = [i for i, _ in EXPORT_CHANNELS]
-    sel = probs23_hw[idxs, :, :].astype(np.float32, copy=False)
-    pal = get_export_palette()
-    rgb = np.einsum("chw,cj->hwj", sel, pal)
+    sel = probs23_hw[idxs, :, :].astype(np.float32, copy=False)  # (C, H, W)
+    pal = get_export_palette()  # (C, 3) in [0, 1]
+
+    h, w = sel.shape[1], sel.shape[2]
+    rgb = np.zeros((h, w, 3), dtype=np.float32)
+    for c in range(sel.shape[0]):
+        contrib = sel[c, :, :, None] * pal[c, None, None, :]
+        np.maximum(rgb, contrib, out=rgb)
+
     mx = float(rgb.max())
     if rescale and mx > 1e-6:
         rgb = rgb / mx
