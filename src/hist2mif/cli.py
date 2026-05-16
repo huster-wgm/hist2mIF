@@ -33,12 +33,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-tif",
         type=Path,
-        help="Full-resolution output TIFF path (default: *_virtual_mIF.tif)",
+        help=(
+            f"1/{SNAPSHOT_STEP} scale JPEG-compressed composite TIFF path "
+            f"(default: *_virtual_mIF.tif)"
+        ),
     )
     parser.add_argument(
         "--snapshot-png",
         type=Path,
-        help=f"1/{SNAPSHOT_STEP} scale PNG snapshot path (default: *_virtual_mIF_snapshot.png)",
+        help=(
+            f"1/{SNAPSHOT_STEP} scale PNG snapshot with marker legend "
+            f"(default: *_virtual_mIF_snapshot.png)"
+        ),
     )
     parser.add_argument(
         "--batch-size",

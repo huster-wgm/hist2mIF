@@ -27,8 +27,14 @@ DEFAULT_CLI_BATCH_SIZE = 128
 DEFAULT_CLI_NUM_WORKERS = 4
 DEFAULT_CLI_PIN_MEMORY = True
 
-# CLI snapshot is written at 1/SNAPSHOT_STEP of the full-resolution composite.
+# CLI outputs (TIFF + PNG) are written at 1/SNAPSHOT_STEP of the full
+# composite. Whole-slide composites at full resolution are ~75 GB raw;
+# downsampling keeps both the JPEG-compressed TIFF and the PNG snapshot
+# small enough to share or open in standard viewers.
 SNAPSHOT_STEP = 50
+
+# JPEG quality used for the downsampled composite TIFF (libjpeg level).
+OUTPUT_JPEG_QUALITY = 90
 
 # Candidate paths probed by _load_font for legend text. Order matters: the
 # first readable TTF wins so the snapshot still renders if a host lacks
@@ -168,7 +174,7 @@ def run_inference_to_tif_and_snapshot(
     threshold: float | None = inference.DEFAULT_ACTIVATION_THRESHOLD,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> dict:
-    """Stream full-resolution TIFF inference and write a 1/SNAPSHOT_STEP PNG snapshot."""
+    """Stream tile inference and write 1/SNAPSHOT_STEP TIFF (JPEG) + PNG snapshot."""
     if mag not in inference.MAG_INPUT_SIZE:
         raise ValueError(f"Unknown magnification: {mag}")
     if batch_size <= 0:
@@ -189,14 +195,7 @@ def run_inference_to_tif_and_snapshot(
     output_tif_path.unlink(missing_ok=True)
     snapshot_png_path.unlink(missing_ok=True)
 
-    output = tifffile.memmap(
-        output_tif_path,
-        shape=(h, w, 3),
-        dtype=np.uint8,
-        photometric="rgb",
-        bigtiff=True,
-    )
-    snapshot = np.zeros(
+    downsampled = np.zeros(
         ((h + SNAPSHOT_STEP - 1) // SNAPSHOT_STEP, (w + SNAPSHOT_STEP - 1) // SNAPSHOT_STEP, 3),
         dtype=np.uint8,
     )
@@ -225,25 +224,25 @@ def run_inference_to_tif_and_snapshot(
                 x0 = int(x0s[i])
                 ph = int(phs[i])
                 pw = int(pws[i])
-                y1 = y0 + ph
-                x1 = x0 + pw
                 comp = inference.composite_virtual_mif_rgb_u8(
                     probs_batch[i, :, :ph, :pw],
                     rescale=False,
                     threshold=threshold,
                 )
-                output[y0:y1, x0:x1, :] = comp
-                _write_snapshot_region(snapshot, comp, y0, x0)
+                _write_snapshot_region(downsampled, comp, y0, x0)
 
                 done += 1
                 if progress_cb is not None:
                     progress_cb(done, total)
 
-            if done % max(nw, 1) == 0:
-                output.flush()
-
-    output.flush()
-    snapshot_with_legend = _attach_legend(snapshot)
+    tifffile.imwrite(
+        output_tif_path,
+        downsampled,
+        photometric="rgb",
+        compression="jpeg",
+        compressionargs={"level": OUTPUT_JPEG_QUALITY},
+    )
+    snapshot_with_legend = _attach_legend(downsampled)
     Image.fromarray(snapshot_with_legend).save(snapshot_png_path)
 
     meta = {
@@ -255,6 +254,9 @@ def run_inference_to_tif_and_snapshot(
         "grid": [nh, nw],
         "image_hw": [h, w],
         "snapshot_scale": 1.0 / SNAPSHOT_STEP,
+        "output_tif_scale": 1.0 / SNAPSHOT_STEP,
+        "output_tif_compression": "jpeg",
+        "output_tif_jpeg_quality": OUTPUT_JPEG_QUALITY,
         "batch_size": batch_size,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
