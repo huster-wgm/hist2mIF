@@ -130,6 +130,7 @@ def run_inference_to_png(
     mag: str,
     *,
     max_side: int | None = None,
+    threshold: float | None = inference.DEFAULT_ACTIVATION_THRESHOLD,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> dict:
     """Run the shared TIFF -> virtual mIF composite PNG workflow synchronously."""
@@ -143,11 +144,12 @@ def run_inference_to_png(
     model, device = _get_or_load_model()
     probs, qmeta = inference.predict_image_quilt(rgb, model, device, mag, progress_cb=progress_cb)
 
-    comp_u8 = inference.composite_virtual_mif_rgb_u8(probs)
+    comp_u8 = inference.composite_virtual_mif_rgb_u8(probs, threshold=threshold)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(comp_u8).save(output_path)
 
     qmeta["downsample_scale"] = scale
+    qmeta["activation_threshold"] = threshold
     return {
         "output_path": str(output_path),
         "quilt_meta": qmeta,
@@ -163,6 +165,7 @@ def run_inference_to_tif_and_snapshot(
     batch_size: int = DEFAULT_CLI_BATCH_SIZE,
     num_workers: int = DEFAULT_CLI_NUM_WORKERS,
     pin_memory: bool = DEFAULT_CLI_PIN_MEMORY,
+    threshold: float | None = inference.DEFAULT_ACTIVATION_THRESHOLD,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> dict:
     """Stream full-resolution TIFF inference and write a 1/SNAPSHOT_STEP PNG snapshot."""
@@ -172,6 +175,8 @@ def run_inference_to_tif_and_snapshot(
         raise ValueError("batch_size must be positive")
     if num_workers < 0:
         raise ValueError("num_workers must be non-negative")
+    if threshold is not None and not (0.0 < float(threshold) < 1.0):
+        raise ValueError("threshold must be in (0, 1) or None for continuous blending")
 
     h, w = inference.get_he_image_shape(src_path)
     tile_size = inference.MAG_INPUT_SIZE[mag]
@@ -225,6 +230,7 @@ def run_inference_to_tif_and_snapshot(
                 comp = inference.composite_virtual_mif_rgb_u8(
                     probs_batch[i, :, :ph, :pw],
                     rescale=False,
+                    threshold=threshold,
                 )
                 output[y0:y1, x0:x1, :] = comp
                 _write_snapshot_region(snapshot, comp, y0, x0)
@@ -252,6 +258,7 @@ def run_inference_to_tif_and_snapshot(
         "batch_size": batch_size,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
+        "activation_threshold": threshold,
     }
     return {
         "output_tif_path": str(output_tif_path),

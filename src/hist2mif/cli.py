@@ -16,6 +16,7 @@ def _default_snapshot_png_path(input_path: Path) -> Path:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    from hist2mif.services.inference import DEFAULT_ACTIVATION_THRESHOLD
     from hist2mif.services.jobs import DEFAULT_CLI_BATCH_SIZE, DEFAULT_CLI_NUM_WORKERS, SNAPSHOT_STEP
 
     parser = argparse.ArgumentParser(
@@ -56,6 +57,17 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable DataLoader pin_memory (enabled by default)",
     )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_ACTIVATION_THRESHOLD,
+        help=(
+            f"Per-pixel sigmoid activation threshold used to binarize each marker "
+            f"before max-blending into the composite (paper default: {DEFAULT_ACTIVATION_THRESHOLD}). "
+            f"Raise toward 1.0 for sparser, paper-figure-style activations; "
+            f"pass --threshold 0 to blend continuous probabilities (debug only)."
+        ),
+    )
     return parser
 
 
@@ -65,6 +77,7 @@ def _validate_args(
     snapshot_png_path: Path,
     batch_size: int,
     workers: int,
+    threshold: float | None,
 ) -> None:
     if not input_path.is_file():
         raise ValueError(f"Input file does not exist: {input_path}")
@@ -84,6 +97,8 @@ def _validate_args(
         raise ValueError("Batch size must be positive")
     if workers < 0:
         raise ValueError("Workers must be non-negative")
+    if threshold is not None and not (0.0 <= threshold < 1.0):
+        raise ValueError("Threshold must be in [0, 1)")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -100,8 +115,17 @@ def main(argv: list[str] | None = None) -> int:
         else _default_snapshot_png_path(input_path)
     )
 
+    threshold: float | None = None if args.threshold == 0 else float(args.threshold)
+
     try:
-        _validate_args(input_path, output_tif_path, snapshot_png_path, args.batch_size, args.workers)
+        _validate_args(
+            input_path,
+            output_tif_path,
+            snapshot_png_path,
+            args.batch_size,
+            args.workers,
+            args.threshold,
+        )
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -119,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
             batch_size=args.batch_size,
             num_workers=args.workers,
             pin_memory=not args.no_pin_memory,
+            threshold=threshold,
             progress_cb=progress,
         )
     except Exception as exc:

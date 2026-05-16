@@ -28,6 +28,13 @@ NUM_CLASSES = 23
 WINDOW = 256
 DEFAULT_INPUT_HW = WINDOW
 
+# Per-pixel binary-activation threshold used by the official GigaTIME
+# `scripts/gigatime_testing.ipynb` (``pred = (probs > 0.5).float()``).
+# Continuous sigmoid outputs from H&E are over-confident and saturate any
+# blend to white; thresholding first yields the paper's dark-background +
+# per-marker color look.
+DEFAULT_ACTIVATION_THRESHOLD = 0.5
+
 # GigaTIME model forward operates on 256x256 windows. For whole-slide CLI
 # inference, read those 256x256 regions directly from TIFF instead of resizing
 # larger tiles and splitting them again.
@@ -106,15 +113,22 @@ def get_export_palette() -> npt.NDArray[np.float32]:
 def composite_virtual_mif_rgb_u8(
     probs23_hw: npt.NDArray[np.float32],
     *,
-    rescale: bool = True,
+    rescale: bool = False,
+    threshold: float | None = DEFAULT_ACTIVATION_THRESHOLD,
 ) -> npt.NDArray[np.uint8]:
     """Blend exported marker probabilities into one RGB image (H, W, 3) uint8.
 
-    Each pixel's R/G/B is the per-channel max of ``prob[c] * color[c]``.
-    Additive blending across 21 channels saturates almost every tissue
-    pixel to white whenever multiple markers fire with moderate probability;
-    max blending keeps the result inside [0, 1] and preserves the dominant
-    marker's color, which matches typical virtual-mIF visualizations.
+    Follows the paper's binary-activation interpretation
+    (`scripts/gigatime_testing.ipynb`): a pixel is "active" for channel c iff
+    ``sigmoid(logits[c]) > threshold``. Each active pixel is painted with that
+    channel's color from `CHANNEL_COLORS_RGB`, and channels are combined via a
+    per-pixel max across (mask * color). Pixels with no active marker stay
+    black, which gives the dark background + colored markers look of the paper
+    Figure 1A/2D / 3H virtual mIF panels.
+
+    Pass ``threshold=None`` to skip binarization and blend continuous
+    probabilities directly (use only for sanity checks; the result will
+    typically wash out because the model is over-confident on H&E).
 
     Background channels TRITC/Cy5 are excluded via EXPORT_CHANNELS.
     """
@@ -122,6 +136,8 @@ def composite_virtual_mif_rgb_u8(
         raise ValueError(f"Expected {NUM_CLASSES} channels, got {probs23_hw.shape[0]}")
     idxs = [i for i, _ in EXPORT_CHANNELS]
     sel = probs23_hw[idxs, :, :].astype(np.float32, copy=False)  # (C, H, W)
+    if threshold is not None:
+        sel = (sel > float(threshold)).astype(np.float32)
     pal = get_export_palette()  # (C, 3) in [0, 1]
 
     h, w = sel.shape[1], sel.shape[2]
