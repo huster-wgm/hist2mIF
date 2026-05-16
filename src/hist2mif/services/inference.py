@@ -27,11 +27,14 @@ from hist2mif.models.gigatime import gigatime
 
 NUM_CLASSES = 23
 WINDOW = 256
+DEFAULT_INPUT_HW = WINDOW
 
-# Match scripts/gigatime_testing.ipynb defaults unless overridden by magnification.
+# GigaTIME model forward operates on 256x256 windows. For whole-slide CLI
+# inference, read those 256x256 regions directly from TIFF instead of resizing
+# larger tiles and splitting them again.
 MAG_INPUT_SIZE: dict[str, int] = {
-    "20x": 512,
-    "10x": 384,
+    "20x": DEFAULT_INPUT_HW,
+    "10x": DEFAULT_INPUT_HW,
 }
 
 _REPO_ID = "prov-gigatime/GigaTIME"
@@ -345,23 +348,31 @@ def do_inference_windows(
     *,
     window_size: int = WINDOW,
 ) -> torch.Tensor:
-    """Slide non-overlapping windows of size window_size across a square input."""
+    """Run non-overlapping windows as one batched model forward."""
     b, _c, h, w = x_bchw.shape
-    if b != 1:
-        raise ValueError("Batch size 1 only")
     if h != w:
         raise ValueError(f"Expected square input, got {h}x{w}")
 
     x = x_bchw.to(device)
     padded = pad_to_multiple(x, window_size)
-    _, _, hp, wp = padded.shape
+    _, c, hp, wp = padded.shape
+    nh = hp // window_size
+    nw = wp // window_size
 
-    out = torch.empty((b, NUM_CLASSES, hp, wp), device=device, dtype=padded.dtype)
-    for i in range(0, hp, window_size):
-        for j in range(0, wp, window_size):
-            win = padded[:, :, i : i + window_size, j : j + window_size]
-            logits = model(win)
-            out[:, :, i : i + window_size, j : j + window_size] = logits
+    windows = (
+        padded.unfold(2, window_size, window_size)
+        .unfold(3, window_size, window_size)
+        .permute(0, 2, 3, 1, 4, 5)
+        .contiguous()
+        .view(b * nh * nw, c, window_size, window_size)
+    )
+    logits = model(windows)
+    out = (
+        logits.view(b, nh, nw, NUM_CLASSES, window_size, window_size)
+        .permute(0, 3, 1, 4, 2, 5)
+        .contiguous()
+        .view(b, NUM_CLASSES, hp, wp)
+    )
     return out[:, :, :h, :w]
 
 
@@ -425,8 +436,11 @@ def predict_image_quilt(
     out = out / counts[np.newaxis, :, :]
 
     meta = {
+        "input_h": input_hw,
+        "input_w": input_hw,
         "input_hw": input_hw,
         "tile_size": ts,
+        "window_size": WINDOW,
         "grid": [nh, nw],
         "image_hw": [h, w],
     }

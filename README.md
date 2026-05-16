@@ -59,10 +59,14 @@ cd hist2mIF
 uv run hist2mif-cli --file /path/to/input.tif --mag 20x
 # writes /path/to/input_virtual_mIF.tif at original resolution
 # and /path/to/input_virtual_mIF_snapshot.png at 1/10 scale
+# reads 256x256 TIFF regions directly through a DataLoader
+# and runs model inference with batch_size=128, workers=4, pin_memory=True
 
 uv run hist2mif-cli --file /path/to/input.tiff --mag 10x \
   --output-tif /path/to/output.tif \
-  --snapshot-png /path/to/output_snapshot.png
+  --snapshot-png /path/to/output_snapshot.png \
+  --batch-size 128 \
+  --workers 4
 ```
 
 Terminal B — React UI (proxies `/api` → backend):

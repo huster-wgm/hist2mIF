@@ -16,6 +16,8 @@ def _default_snapshot_png_path(input_path: Path) -> Path:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    from hist2mif.services.jobs import DEFAULT_CLI_BATCH_SIZE, DEFAULT_CLI_NUM_WORKERS
+
     parser = argparse.ArgumentParser(
         prog="hist2mif-cli",
         description="Run Hist2mIF locally on a .tif/.tiff file and write TIFF + PNG outputs.",
@@ -37,10 +39,33 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="1/10 scale PNG snapshot path (default: *_virtual_mIF_snapshot.png)",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_CLI_BATCH_SIZE,
+        help=f"Number of tiles to infer per GPU batch (default: {DEFAULT_CLI_BATCH_SIZE})",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_CLI_NUM_WORKERS,
+        help=f"DataLoader worker processes for TIFF region loading (default: {DEFAULT_CLI_NUM_WORKERS})",
+    )
+    parser.add_argument(
+        "--no-pin-memory",
+        action="store_true",
+        help="Disable DataLoader pin_memory (enabled by default)",
+    )
     return parser
 
 
-def _validate_paths(input_path: Path, output_tif_path: Path, snapshot_png_path: Path) -> None:
+def _validate_args(
+    input_path: Path,
+    output_tif_path: Path,
+    snapshot_png_path: Path,
+    batch_size: int,
+    workers: int,
+) -> None:
     if not input_path.is_file():
         raise ValueError(f"Input file does not exist: {input_path}")
     if input_path.suffix.lower() not in {".tif", ".tiff"}:
@@ -55,6 +80,10 @@ def _validate_paths(input_path: Path, output_tif_path: Path, snapshot_png_path: 
         raise ValueError("Snapshot PNG path must not overwrite the input file")
     if output_tif_path == snapshot_png_path:
         raise ValueError("Output TIFF and snapshot PNG paths must be different")
+    if batch_size <= 0:
+        raise ValueError("Batch size must be positive")
+    if workers < 0:
+        raise ValueError("Workers must be non-negative")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -72,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        _validate_paths(input_path, output_tif_path, snapshot_png_path)
+        _validate_args(input_path, output_tif_path, snapshot_png_path, args.batch_size, args.workers)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -87,6 +116,9 @@ def main(argv: list[str] | None = None) -> int:
             output_tif_path,
             snapshot_png_path,
             args.mag,
+            batch_size=args.batch_size,
+            num_workers=args.workers,
+            pin_memory=not args.no_pin_memory,
             progress_cb=progress,
         )
     except Exception as exc:

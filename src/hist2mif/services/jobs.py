@@ -15,11 +15,16 @@ import numpy as np
 import torch
 import tifffile
 from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 
 from hist2mif.core.config import settings
 from hist2mif.services import inference
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_CLI_BATCH_SIZE = 128
+DEFAULT_CLI_NUM_WORKERS = 4
+DEFAULT_CLI_PIN_MEMORY = True
 
 _model: object | None = None
 _model_device: object | None = None
@@ -140,11 +145,18 @@ def run_inference_to_tif_and_snapshot(
     snapshot_png_path: Path,
     mag: str,
     *,
+    batch_size: int = DEFAULT_CLI_BATCH_SIZE,
+    num_workers: int = DEFAULT_CLI_NUM_WORKERS,
+    pin_memory: bool = DEFAULT_CLI_PIN_MEMORY,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> dict:
     """Stream full-resolution TIFF inference and write a 1/10 PNG snapshot."""
     if mag not in inference.MAG_INPUT_SIZE:
         raise ValueError(f"Unknown magnification: {mag}")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
 
     h, w = inference.get_he_image_shape(src_path)
     tile_size = inference.MAG_INPUT_SIZE[mag]
@@ -166,50 +178,95 @@ def run_inference_to_tif_and_snapshot(
     )
     snapshot = np.zeros(((h + 9) // 10, (w + 9) // 10, 3), dtype=np.uint8)
 
+    dataset = _TiffTileDataset(src_path, h, w, tile_size)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    loader_iter = iter(loader)
+
     model, device = _get_or_load_model()
-    transform = inference.build_val_transform(tile_size)
 
     done = 0
-    for yi in range(nh):
-        for xi in range(nw):
-            y0 = yi * tile_size
-            x0 = xi * tile_size
-            y1 = min(y0 + tile_size, h)
-            x1 = min(x0 + tile_size, w)
-            ph, pw = y1 - y0, x1 - x0
+    with torch.inference_mode():
+        for batch, y0s, x0s, phs, pws in loader_iter:
+            batch = batch.to(device=device, dtype=torch.float32, non_blocking=pin_memory)
+            logits = model(batch)
+            probs_batch = torch.sigmoid(logits).float().detach().cpu().numpy()
 
-            patch = np.zeros((tile_size, tile_size, 3), dtype=np.uint8)
-            patch[:ph, :pw, :] = inference.read_he_region(src_path, y0, y1, x0, x1)
+            for i in range(probs_batch.shape[0]):
+                y0 = int(y0s[i])
+                x0 = int(x0s[i])
+                ph = int(phs[i])
+                pw = int(pws[i])
+                y1 = y0 + ph
+                x1 = x0 + pw
+                comp = inference.composite_virtual_mif_rgb_u8(
+                    probs_batch[i, :, :ph, :pw],
+                    rescale=False,
+                )
+                output[y0:y1, x0:x1, :] = comp
+                _write_snapshot_region(snapshot, comp, y0, x0)
 
-            x = inference.preprocess_patch(patch, transform).to(dtype=torch.float32)
-            logits = inference.do_inference_windows(x, model, device, window_size=inference.WINDOW)
-            probs = torch.sigmoid(logits)[0].float().cpu().numpy()
-            comp = inference.composite_virtual_mif_rgb_u8(probs[:, :ph, :pw], rescale=False)
+                done += 1
+                if progress_cb is not None:
+                    progress_cb(done, total)
 
-            output[y0:y1, x0:x1, :] = comp
-            _write_snapshot_region(snapshot, comp, y0, x0)
-
-            done += 1
             if done % max(nw, 1) == 0:
                 output.flush()
-            if progress_cb is not None:
-                progress_cb(done, total)
 
     output.flush()
     Image.fromarray(snapshot).save(snapshot_png_path)
 
     meta = {
+        "input_h": tile_size,
+        "input_w": tile_size,
         "input_hw": tile_size,
         "tile_size": tile_size,
+        "window_size": inference.WINDOW,
         "grid": [nh, nw],
         "image_hw": [h, w],
         "snapshot_scale": 0.1,
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
     }
     return {
         "output_tif_path": str(output_tif_path),
         "snapshot_png_path": str(snapshot_png_path),
         "quilt_meta": meta,
     }
+
+
+class _TiffTileDataset(Dataset):
+    def __init__(self, src_path: Path, height: int, width: int, tile_size: int) -> None:
+        self.src_path = src_path
+        self.height = height
+        self.width = width
+        self.tile_size = tile_size
+        self.nw = (width + tile_size - 1) // tile_size
+        self.total = ((height + tile_size - 1) // tile_size) * self.nw
+        self.transform = inference.build_val_transform(tile_size)
+
+    def __len__(self) -> int:
+        return self.total
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int, int, int, int]:
+        yi = idx // self.nw
+        xi = idx % self.nw
+        y0 = yi * self.tile_size
+        x0 = xi * self.tile_size
+        y1 = min(y0 + self.tile_size, self.height)
+        x1 = min(x0 + self.tile_size, self.width)
+        ph, pw = y1 - y0, x1 - x0
+
+        patch = np.zeros((self.tile_size, self.tile_size, 3), dtype=np.uint8)
+        patch[:ph, :pw, :] = inference.read_he_region(self.src_path, y0, y1, x0, x1)
+        tensor = inference.preprocess_patch(patch, self.transform).squeeze(0)
+        return tensor, y0, x0, ph, pw
 
 
 def _write_snapshot_region(
