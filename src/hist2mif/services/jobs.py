@@ -28,7 +28,7 @@ DEFAULT_CLI_NUM_WORKERS = 4
 DEFAULT_CLI_PIN_MEMORY = True
 
 # CLI snapshot is written at 1/SNAPSHOT_STEP of the full-resolution composite.
-SNAPSHOT_STEP = 20
+SNAPSHOT_STEP = 50
 
 # Candidate paths probed by _load_font for legend text. Order matters: the
 # first readable TTF wins so the snapshot still renders if a host lacks

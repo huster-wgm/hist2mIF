@@ -58,7 +58,7 @@ Local one-shot CLI:
 cd hist2mIF
 uv run hist2mif-cli --file /path/to/input.tif --mag 20x
 # writes /path/to/input_virtual_mIF.tif at original resolution
-# and /path/to/input_virtual_mIF_snapshot.png at 1/20 scale + paper legend
+# and /path/to/input_virtual_mIF_snapshot.png at 1/50 scale + paper legend
 # reads 256x256 TIFF regions directly through a DataLoader
 # and runs model inference with batch_size=128, workers=4, pin_memory=True
 
