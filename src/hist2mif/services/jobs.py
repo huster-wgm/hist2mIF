@@ -14,10 +14,11 @@ from typing import Callable
 import numpy as np
 import torch
 import tifffile
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader, Dataset
 
 from hist2mif.core.config import settings
+from hist2mif.domain.channels import legend_entries
 from hist2mif.services import inference
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,17 @@ DEFAULT_CLI_PIN_MEMORY = True
 
 # CLI snapshot is written at 1/SNAPSHOT_STEP of the full-resolution composite.
 SNAPSHOT_STEP = 20
+
+# Candidate paths probed by _load_font for legend text. Order matters: the
+# first readable TTF wins so the snapshot still renders if a host lacks
+# DejaVu (Ubuntu container, minimal Debian image, etc.).
+_LEGEND_FONT_PATHS: tuple[str, ...] = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+)
 
 _model: object | None = None
 _model_device: object | None = None
@@ -225,7 +237,8 @@ def run_inference_to_tif_and_snapshot(
                 output.flush()
 
     output.flush()
-    Image.fromarray(snapshot).save(snapshot_png_path)
+    snapshot_with_legend = _attach_legend(snapshot)
+    Image.fromarray(snapshot_with_legend).save(snapshot_png_path)
 
     meta = {
         "input_h": tile_size,
@@ -273,6 +286,69 @@ class _TiffTileDataset(Dataset):
         patch[:ph, :pw, :] = inference.read_he_region(self.src_path, y0, y1, x0, x1)
         tensor = inference.preprocess_patch(patch, self.transform).squeeze(0)
         return tensor, y0, x0, ph, pw
+
+
+def _load_font(size: int) -> ImageFont.ImageFont:
+    for path in _LEGEND_FONT_PATHS:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _render_legend(target_height: int) -> np.ndarray:
+    """Render the paper color legend at a size proportional to ``target_height``."""
+    entries = legend_entries()
+    n = len(entries)
+
+    row_h = max(12, min(48, target_height // (n + 3)))
+    swatch = max(8, int(row_h * 0.7))
+    font_size = max(10, int(row_h * 0.6))
+    padding = max(6, row_h // 3)
+
+    font = _load_font(font_size)
+    text_w = 0
+    for name, _ in entries:
+        bbox = font.getbbox(name)
+        text_w = max(text_w, bbox[2] - bbox[0])
+
+    legend_w = padding + swatch + padding + text_w + padding
+    legend_h = max(target_height, n * row_h + 2 * padding)
+
+    img = Image.new("RGB", (legend_w, legend_h), color=(0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    total_rows_h = n * row_h
+    start_y = (legend_h - total_rows_h) // 2
+
+    for i, (name, color) in enumerate(entries):
+        row_y = start_y + i * row_h
+        sy = row_y + (row_h - swatch) // 2
+        sx = padding
+        draw.rectangle([sx, sy, sx + swatch, sy + swatch], fill=color)
+
+        bbox = font.getbbox(name)
+        text_h = bbox[3] - bbox[1]
+        tx = sx + swatch + padding
+        ty = row_y + (row_h - text_h) // 2 - bbox[1]
+        draw.text((tx, ty), name, fill=(255, 255, 255), font=font)
+
+    return np.array(img, dtype=np.uint8)
+
+
+def _attach_legend(snapshot: np.ndarray) -> np.ndarray:
+    """Place the marker legend to the right of ``snapshot`` on a black background."""
+    legend = _render_legend(snapshot.shape[0])
+
+    h_snap, w_snap = snapshot.shape[:2]
+    h_leg, w_leg = legend.shape[:2]
+    out_h = max(h_snap, h_leg)
+
+    canvas = np.zeros((out_h, w_snap + w_leg, 3), dtype=np.uint8)
+    canvas[:h_snap, :w_snap, :] = snapshot
+    canvas[:h_leg, w_snap : w_snap + w_leg, :] = legend
+    return canvas
 
 
 def _write_snapshot_region(

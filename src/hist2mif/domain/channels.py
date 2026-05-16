@@ -37,6 +37,41 @@ CHANNEL_NAMES_23: list[str] = [
 BACKGROUND_INDICES = {1, 2}
 
 
+# Cleaner labels for the composite legend (strips the `-D` / `-B` model suffixes).
+CHANNEL_DISPLAY_NAMES: dict[str, str] = {
+    "Actin-D": "Actin",
+    "Caspase3-D": "Caspase 3",
+    "PHH3-B": "PHH3",
+}
+
+
+# Top-to-bottom order used when drawing the legend next to the composite snapshot.
+# Mirrors the GigaTIME paper figure so users can cross-reference the published palette.
+LEGEND_ORDER: list[str] = [
+    "CD8",
+    "PD-1",
+    "Tryptase",
+    "PHH3-B",
+    "CD16",
+    "CD14",
+    "CD138",
+    "Transgelin",
+    "CD11c",
+    "Actin-D",
+    "CD20",
+    "CD34",
+    "Caspase3-D",
+    "T-bet",
+    "CK",
+    "DAPI",
+    "CD68",
+    "CD3",
+    "PD-L1",
+    "Ki67",
+    "CD4",
+]
+
+
 # Per-marker composite colors aligned to the GigaTIME paper legend (uint8 RGB).
 # Keys match CHANNEL_NAMES_23 entries; only the 21 non-background markers are used.
 CHANNEL_COLORS_RGB: dict[str, tuple[int, int, int]] = {
@@ -86,3 +121,15 @@ def export_channel_colors_u8() -> list[tuple[int, int, int]]:
             raise KeyError(f"Missing composite color for channel {name!r}")
         out.append(color)
     return out
+
+
+def legend_entries() -> list[tuple[str, tuple[int, int, int]]]:
+    """Return (display_name, RGB uint8) pairs in paper legend order."""
+    entries: list[tuple[str, tuple[int, int, int]]] = []
+    for name in LEGEND_ORDER:
+        color = CHANNEL_COLORS_RGB.get(name)
+        if color is None:
+            raise KeyError(f"Missing composite color for channel {name!r}")
+        display = CHANNEL_DISPLAY_NAMES.get(name, name)
+        entries.append((display, color))
+    return entries
