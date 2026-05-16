@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader, Dataset
 
 from hist2mif.core.config import settings
-from hist2mif.domain.channels import legend_entries
+from hist2mif.domain.channels import CHANNEL_NAMES_23, EXPORT_CHANNELS, legend_entries
 from hist2mif.services import inference
 
 logger = logging.getLogger(__name__)
@@ -27,13 +27,16 @@ DEFAULT_CLI_BATCH_SIZE = 128
 DEFAULT_CLI_NUM_WORKERS = 4
 DEFAULT_CLI_PIN_MEMORY = True
 
-# CLI outputs (TIFF + PNG) are written at 1/SNAPSHOT_STEP of the full
-# composite. Whole-slide composites at full resolution are ~75 GB raw;
-# downsampling keeps both the JPEG-compressed TIFF and the PNG snapshot
-# small enough to share or open in standard viewers.
+# CLI composite snapshot PNG is written at 1/SNAPSHOT_STEP of the slide so
+# whole-slide overviews fit comfortably in a single image with the legend.
 SNAPSHOT_STEP = 50
 
-# JPEG quality used for the downsampled composite TIFF (libjpeg level).
+# Multi-channel binary-mask TIFF is kept at higher fidelity (1/MASK_TIF_STEP)
+# so it remains usable for downstream per-marker analysis while staying small
+# enough to ship as a normal JPEG TIFF instead of a multi-gigabyte BigTIFF.
+MASK_TIF_STEP = 20
+
+# JPEG quality used for the per-channel mask TIFF pages (libjpeg level).
 OUTPUT_JPEG_QUALITY = 90
 
 # Candidate paths probed by _load_font for legend text. Order matters: the
@@ -174,7 +177,7 @@ def run_inference_to_tif_and_snapshot(
     threshold: float | None = inference.DEFAULT_ACTIVATION_THRESHOLD,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> dict:
-    """Stream tile inference and write 1/SNAPSHOT_STEP TIFF (JPEG) + PNG snapshot."""
+    """Stream tile inference and write a 21-channel binary-mask TIFF + composite PNG."""
     if mag not in inference.MAG_INPUT_SIZE:
         raise ValueError(f"Unknown magnification: {mag}")
     if batch_size <= 0:
@@ -195,9 +198,21 @@ def run_inference_to_tif_and_snapshot(
     output_tif_path.unlink(missing_ok=True)
     snapshot_png_path.unlink(missing_ok=True)
 
-    downsampled = np.zeros(
+    export_idxs = np.asarray([i for i, _ in EXPORT_CHANNELS], dtype=np.int64)
+    channel_names = [CHANNEL_NAMES_23[i] for i in export_idxs]
+    n_channels = export_idxs.size
+
+    mask_h = (h + MASK_TIF_STEP - 1) // MASK_TIF_STEP
+    mask_w = (w + MASK_TIF_STEP - 1) // MASK_TIF_STEP
+    mask_buffer = np.zeros((n_channels, mask_h, mask_w), dtype=np.uint8)
+
+    snapshot = np.zeros(
         ((h + SNAPSHOT_STEP - 1) // SNAPSHOT_STEP, (w + SNAPSHOT_STEP - 1) // SNAPSHOT_STEP, 3),
         dtype=np.uint8,
+    )
+
+    mask_threshold = float(
+        threshold if threshold is not None else inference.DEFAULT_ACTIVATION_THRESHOLD
     )
 
     dataset = _TiffTileDataset(src_path, h, w, tile_size)
@@ -224,25 +239,34 @@ def run_inference_to_tif_and_snapshot(
                 x0 = int(x0s[i])
                 ph = int(phs[i])
                 pw = int(pws[i])
+                probs_tile = probs_batch[i, :, :ph, :pw]
+
                 comp = inference.composite_virtual_mif_rgb_u8(
-                    probs_batch[i, :, :ph, :pw],
+                    probs_tile,
                     rescale=False,
                     threshold=threshold,
                 )
-                _write_snapshot_region(downsampled, comp, y0, x0)
+                _write_snapshot_region(snapshot, comp, y0, x0)
+
+                mask_tile = (probs_tile[export_idxs] > mask_threshold).astype(np.uint8) * 255
+                _write_mask_region(mask_buffer, mask_tile, y0, x0, MASK_TIF_STEP)
 
                 done += 1
                 if progress_cb is not None:
                     progress_cb(done, total)
 
-    tifffile.imwrite(
-        output_tif_path,
-        downsampled,
-        photometric="rgb",
-        compression="jpeg",
-        compressionargs={"level": OUTPUT_JPEG_QUALITY},
-    )
-    snapshot_with_legend = _attach_legend(downsampled)
+    with tifffile.TiffWriter(output_tif_path) as tw:
+        for ch_idx in range(n_channels):
+            tw.write(
+                mask_buffer[ch_idx],
+                photometric="minisblack",
+                compression="jpeg",
+                compressionargs={"level": OUTPUT_JPEG_QUALITY},
+                description=channel_names[ch_idx],
+                metadata={"channel": channel_names[ch_idx], "index": int(ch_idx)},
+            )
+
+    snapshot_with_legend = _attach_legend(snapshot)
     Image.fromarray(snapshot_with_legend).save(snapshot_png_path)
 
     meta = {
@@ -254,9 +278,11 @@ def run_inference_to_tif_and_snapshot(
         "grid": [nh, nw],
         "image_hw": [h, w],
         "snapshot_scale": 1.0 / SNAPSHOT_STEP,
-        "output_tif_scale": 1.0 / SNAPSHOT_STEP,
+        "output_tif_scale": 1.0 / MASK_TIF_STEP,
         "output_tif_compression": "jpeg",
         "output_tif_jpeg_quality": OUTPUT_JPEG_QUALITY,
+        "output_tif_channels": channel_names,
+        "output_tif_threshold": mask_threshold,
         "batch_size": batch_size,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
@@ -376,6 +402,27 @@ def _write_snapshot_region(
     tile_y = keep_y - y0
     tile_x = keep_x - x0
     snapshot[np.ix_(keep_y // SNAPSHOT_STEP, keep_x // SNAPSHOT_STEP)] = comp[np.ix_(tile_y, tile_x)]
+
+
+def _write_mask_region(
+    buffer: np.ndarray,
+    tile: np.ndarray,
+    y0: int,
+    x0: int,
+    step: int,
+) -> None:
+    """Stride-sample a (C, ph, pw) tile into a (C, H, W) buffer at integer step."""
+    _, ph, pw = tile.shape
+    ys = np.arange(y0, y0 + ph)
+    xs = np.arange(x0, x0 + pw)
+    sel_y = np.where(ys % step == 0)[0]
+    sel_x = np.where(xs % step == 0)[0]
+    if sel_y.size == 0 or sel_x.size == 0:
+        return
+    dst_y0 = int(ys[sel_y[0]] // step)
+    dst_x0 = int(xs[sel_x[0]] // step)
+    src = tile[:, sel_y, :][:, :, sel_x]
+    buffer[:, dst_y0 : dst_y0 + sel_y.size, dst_x0 : dst_x0 + sel_x.size] = src
 
 
 def _run_job_worker(job_id: str, saved_input: Path, mag: str) -> None:

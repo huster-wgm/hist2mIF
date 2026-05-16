@@ -17,7 +17,12 @@ def _default_snapshot_png_path(input_path: Path) -> Path:
 
 def _build_parser() -> argparse.ArgumentParser:
     from hist2mif.services.inference import DEFAULT_ACTIVATION_THRESHOLD
-    from hist2mif.services.jobs import DEFAULT_CLI_BATCH_SIZE, DEFAULT_CLI_NUM_WORKERS, SNAPSHOT_STEP
+    from hist2mif.services.jobs import (
+        DEFAULT_CLI_BATCH_SIZE,
+        DEFAULT_CLI_NUM_WORKERS,
+        MASK_TIF_STEP,
+        SNAPSHOT_STEP,
+    )
 
     parser = argparse.ArgumentParser(
         prog="hist2mif-cli",
@@ -34,8 +39,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output-tif",
         type=Path,
         help=(
-            f"1/{SNAPSHOT_STEP} scale JPEG-compressed composite TIFF path "
-            f"(default: *_virtual_mIF.tif)"
+            f"21-channel binary-mask TIFF at 1/{MASK_TIF_STEP} scale "
+            f"(JPEG-compressed, one grayscale uint8 page per marker; "
+            f"default: *_virtual_mIF.tif)"
         ),
     )
     parser.add_argument(

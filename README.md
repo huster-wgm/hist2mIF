@@ -57,9 +57,10 @@ Local one-shot CLI:
 ```bash
 cd hist2mIF
 uv run hist2mif-cli --file /path/to/input.tif --mag 20x
-# writes both outputs at 1/50 of the source resolution:
-#   /path/to/input_virtual_mIF.tif           (JPEG-compressed RGB TIFF, q=90)
-#   /path/to/input_virtual_mIF_snapshot.png  (PNG snapshot + paper color legend)
+# writes:
+#   /path/to/input_virtual_mIF.tif           21-channel binary mask, uint8,
+#                                            1/20 scale, JPEG q=90, one page per marker
+#   /path/to/input_virtual_mIF_snapshot.png  1/50 scale composite + paper color legend
 # reads 256x256 TIFF regions directly through a DataLoader
 # and runs model inference with batch_size=128, workers=4, pin_memory=True
 
