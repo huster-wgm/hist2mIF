@@ -1,7 +1,8 @@
 """GigaTIME channel order (model output indices 0..22).
 
 See prov-gigatime/GigaTIME issue #8 / scripts/db_test.py common_channel_list.
-TRITC and Cy5 are background channels; we export the remaining 21 channels as .tif.
+TRITC and Cy5 are background channels; the UI composites the remaining 21 markers
+into one RGB overlay (see `hist2mif.services.inference.composite_virtual_mif_rgb_u8`).
 """
 
 from __future__ import annotations

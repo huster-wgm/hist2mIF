@@ -28,3 +28,6 @@ data/
 
 # uv cache (if copied)
 .uv-cache/
+
+# Frontend
+frontend/node_modules/

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import colorsys
 import math
 import os
-import zipfile
 from pathlib import Path
 from typing import Callable
+
+# Avoid noisy update-check warnings in CLI/API logs.
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 
 import albumentations as geometric
 import numpy as np
@@ -19,8 +22,8 @@ from albumentations.core.composition import Compose
 from huggingface_hub import snapshot_download
 from PIL import Image
 
-from hist2mif.archs import gigatime
-from hist2mif.channels import CHANNEL_NAMES_23, EXPORT_CHANNELS
+from hist2mif.domain.channels import EXPORT_CHANNELS
+from hist2mif.models.gigatime import gigatime
 
 NUM_CLASSES = 23
 WINDOW = 256
@@ -33,13 +36,92 @@ MAG_INPUT_SIZE: dict[str, int] = {
 
 _REPO_ID = "prov-gigatime/GigaTIME"
 
+# Deployment policy: GPU server ships PyTorch wheels linked against CUDA >= 12.8 (cu128+).
+MIN_TORCH_CUDA_MAJOR = 12
+MIN_TORCH_CUDA_MINOR = 8
+
+_PALETTE_21: npt.NDArray[np.float32] | None = None
+
+
+def _parse_torch_cuda_version(version: str | None) -> tuple[int, int] | None:
+    if not version:
+        return None
+    parts = version.strip().split(".")
+    if not parts:
+        return None
+    try:
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        return major, minor
+    except ValueError:
+        return None
+
+
+def assert_cuda_runtime_ok() -> torch.device:
+    """Require NVIDIA CUDA per server policy (torch.version.cuda >= 12.8)."""
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "Hist2mIF requires an NVIDIA GPU with CUDA enabled (torch.cuda.is_available() is False)."
+        )
+    ver = _parse_torch_cuda_version(torch.version.cuda)
+    if ver is None:
+        raise RuntimeError(
+            "Hist2mIF requires a CUDA-enabled PyTorch wheel (torch.version.cuda is empty). "
+            "Install from https://download.pytorch.org/whl/cu128"
+        )
+    if ver < (MIN_TORCH_CUDA_MAJOR, MIN_TORCH_CUDA_MINOR):
+        raise RuntimeError(
+            f"Hist2mIF requires PyTorch built with CUDA >= {MIN_TORCH_CUDA_MAJOR}.{MIN_TORCH_CUDA_MINOR} "
+            f"(torch.version.cuda={torch.version.cuda!r}). "
+            "Reinstall torch/torchvision from the cu128 wheel index."
+        )
+    return torch.device("cuda")
+
 
 def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+    return assert_cuda_runtime_ok()
+
+
+def _build_distinct_palette(n: int) -> npt.NDArray[np.float32]:
+    """HSV-spread RGB palette in [0,1], shape (n, 3)."""
+    cols = []
+    for i in range(n):
+        h = (i + 0.35) / max(n, 1)
+        s = float(0.78 + 0.06 * ((i % 4) / 3.0))
+        v = float(0.82 + 0.12 * ((i % 3) / 2.0))
+        r, g, b = colorsys.hsv_to_rgb(h % 1.0, s, v)
+        cols.append([r, g, b])
+    return np.asarray(cols, dtype=np.float32)
+
+
+def get_export_palette() -> npt.NDArray[np.float32]:
+    """One RGB color per exported channel (same order as EXPORT_CHANNELS)."""
+    global _PALETTE_21
+    if _PALETTE_21 is None:
+        _PALETTE_21 = _build_distinct_palette(len(EXPORT_CHANNELS))
+    return _PALETTE_21
+
+
+def composite_virtual_mif_rgb_u8(
+    probs23_hw: npt.NDArray[np.float32],
+    *,
+    rescale: bool = True,
+) -> npt.NDArray[np.uint8]:
+    """Blend exported marker probabilities into one RGB image (H, W, 3) uint8.
+
+    Uses additive mixing with channel-specific palette colors; intensities are globally rescaled to [0,255].
+    Background channels TRITC/Cy5 are excluded via EXPORT_CHANNELS.
+    """
+    if probs23_hw.shape[0] != NUM_CLASSES:
+        raise ValueError(f"Expected {NUM_CLASSES} channels, got {probs23_hw.shape[0]}")
+    idxs = [i for i, _ in EXPORT_CHANNELS]
+    sel = probs23_hw[idxs, :, :].astype(np.float32, copy=False)
+    pal = get_export_palette()
+    rgb = np.einsum("chw,cj->hwj", sel, pal)
+    mx = float(rgb.max())
+    if rescale and mx > 1e-6:
+        rgb = rgb / mx
+    return (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
 def load_model(
@@ -69,11 +151,86 @@ def load_model(
     return model
 
 
-def load_he_image(path: Path) -> npt.NDArray[np.uint8]:
-    """Load a TIFF/SVS-style raster as RGB uint8 (H, W, 3)."""
-    arr = tifffile.imread(path)
+def load_he_image(path: Path, *, max_side: int | None = None) -> npt.NDArray[np.uint8]:
+    """Load a TIFF/SVS-style raster as RGB uint8 (H, W, 3).
+
+    If a pyramidal TIFF is provided, decode the smallest level that still covers
+    max_side so very large whole-slide images are not read at full resolution.
+    """
+    arr = _read_tiff_level(path, max_side=max_side)
     rgb = _to_rgb_uint8(arr)
     return rgb
+
+
+def get_he_image_shape(path: Path) -> tuple[int, int]:
+    """Return the full-resolution H, W shape without decoding image pixels."""
+    with tifffile.TiffFile(path) as tif:
+        if not tif.series:
+            raise ValueError(f"No image series found in {path}")
+        hw = _shape_hw(tif.series[0].levels[0].shape)
+        if hw is None:
+            raise ValueError(f"Unsupported TIFF shape: {tif.series[0].levels[0].shape}")
+        return hw
+
+
+def read_he_region(path: Path, y0: int, y1: int, x0: int, x1: int) -> npt.NDArray[np.uint8]:
+    """Decode only the requested full-resolution region as RGB uint8."""
+    with tifffile.TiffFile(path) as tif:
+        if not tif.series:
+            raise ValueError(f"No image series found in {path}")
+        shape = tif.series[0].levels[0].shape
+
+    if len(shape) == 2:
+        selection = (slice(y0, y1), slice(x0, x1))
+    elif len(shape) == 3 and shape[-1] in (1, 3, 4):
+        selection = (slice(y0, y1), slice(x0, x1), slice(None))
+    elif len(shape) == 3 and shape[0] in (1, 3, 4):
+        selection = (slice(None), slice(y0, y1), slice(x0, x1))
+    else:
+        raise ValueError(f"Unsupported TIFF shape: {shape}")
+
+    arr = tifffile.imread(path, selection=selection)
+    return _to_rgb_uint8(arr)
+
+
+def _read_tiff_level(path: Path, *, max_side: int | None) -> npt.NDArray[np.floating | np.integer]:
+    if max_side is None or max_side <= 0:
+        return tifffile.imread(path)
+
+    with tifffile.TiffFile(path) as tif:
+        if not tif.series:
+            raise ValueError(f"No image series found in {path}")
+        series = tif.series[0]
+        levels = list(getattr(series, "levels", None) or [series])
+        level = _select_pyramid_level(levels, max_side)
+        return level.asarray()
+
+
+def _select_pyramid_level(levels: list, max_side: int):
+    shaped_levels = [(level, _shape_hw(level.shape)) for level in levels]
+    covering = [
+        (level, hw)
+        for level, hw in shaped_levels
+        if hw is not None and max(hw) >= max_side
+    ]
+    if covering:
+        return min(covering, key=lambda item: max(item[1]))[0]
+
+    valid = [(level, hw) for level, hw in shaped_levels if hw is not None]
+    if valid:
+        return max(valid, key=lambda item: max(item[1]))[0]
+    return levels[0]
+
+
+def _shape_hw(shape: tuple[int, ...]) -> tuple[int, int] | None:
+    if len(shape) == 2:
+        return shape[0], shape[1]
+    if len(shape) == 3:
+        if shape[-1] in (1, 3, 4):
+            return shape[0], shape[1]
+        if shape[0] in (1, 3, 4):
+            return shape[1], shape[2]
+    return None
 
 
 def _to_rgb_uint8(arr: npt.NDArray[np.floating | np.integer]) -> npt.NDArray[np.uint8]:
@@ -84,7 +241,6 @@ def _to_rgb_uint8(arr: npt.NDArray[np.floating | np.integer]) -> npt.NDArray[np.
         return np.stack([u8, u8, u8], axis=-1)
 
     if arr.ndim == 3:
-        # Prefer obvious HWC RGB/RGBA; otherwise treat small leading dim as CHW.
         if arr.shape[-1] in (3, 4):
             hwc = np.asarray(arr)
         elif arr.shape[0] in (1, 3, 4):
@@ -135,7 +291,6 @@ def _scale_to_01(x: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
     if math.isclose(mx, mn):
         return np.zeros_like(x, dtype=np.float32)
     if mx <= 1.5 and mn >= -0.5:
-        # Likely already 0..1 floats
         return np.clip(x, 0.0, 1.0)
     return np.clip((x - mn) / (mx - mn), 0.0, 1.0)
 
@@ -276,34 +431,3 @@ def predict_image_quilt(
         "image_hw": [h, w],
     }
     return out, meta
-
-
-def write_export_tifs(
-    probs23_hw: npt.NDArray[np.float32],
-    out_dir: Path,
-    *,
-    stem: str,
-) -> list[Path]:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    written: list[Path] = []
-    for idx, safe in EXPORT_CHANNELS:
-        name = CHANNEL_NAMES_23[idx]
-        fp = out_dir / f"{stem}__{safe}__{name}.tif"
-        tifffile.imwrite(fp, probs23_hw[idx].astype(np.float32), photometric="minisblack", compression=None)
-        written.append(fp)
-    return written
-
-
-def zip_exports(tif_paths: list[Path], zip_path: Path) -> Path:
-    zip_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for p in tif_paths:
-            zf.write(p, arcname=p.name)
-    return zip_path
-
-
-def dapi_preview_u8(probs: npt.NDArray[np.float32]) -> npt.NDArray[np.uint8]:
-    """Channel 0 == DAPI probability map -> uint8 for UI."""
-    dapi = probs[0]
-    x = np.clip(dapi, 0.0, 1.0)
-    return (x * 255.0).astype(np.uint8)
