@@ -15,16 +15,19 @@ def _default_snapshot_png_path(input_path: Path) -> Path:
     return input_path.with_name(f"{input_path.stem}_virtual_mIF_snapshot.png")
 
 
+def _default_thumbnail_png_path(input_path: Path) -> Path:
+    return input_path.with_name(f"{input_path.stem}_virtual_mIF_thumbnail.png")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     from hist2mif.services.inference import DEFAULT_ACTIVATION_THRESHOLD
     from hist2mif.services.jobs import (
         DEFAULT_CLI_BATCH_SIZE,
         DEFAULT_CLI_NUM_WORKERS,
         MASK_TIF_DOWNSAMPLE,
-        SNAPSHOT_OF_MASK_RATIO,
+        THUMBNAIL_GRID_COLS,
+        THUMBNAIL_GRID_ROWS,
     )
-
-    snapshot_total_downsample = MASK_TIF_DOWNSAMPLE * SNAPSHOT_OF_MASK_RATIO
 
     parser = argparse.ArgumentParser(
         prog="hist2mif-cli",
@@ -50,10 +53,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "--snapshot-png",
         type=Path,
         help=(
-            f"1/{snapshot_total_downsample} scale PNG snapshot with marker legend "
-            f"(composited from the 1/{MASK_TIF_DOWNSAMPLE} mask then resized "
-            f"by 1/{SNAPSHOT_OF_MASK_RATIO} with cv2.INTER_NEAREST; "
+            f"1/{MASK_TIF_DOWNSAMPLE} scale PNG snapshot with marker legend "
+            f"(same resolution as the mask TIFF; composited from the mask buffer "
+            f"with each color contributing 1/21; "
             f"default: *_virtual_mIF_snapshot.png)"
+        ),
+    )
+    parser.add_argument(
+        "--thumbnail-png",
+        type=Path,
+        help=(
+            f"{THUMBNAIL_GRID_COLS}x{THUMBNAIL_GRID_ROWS} per-channel thumbnail grid "
+            f"(each cell shows one marker's mask painted with its paper color, "
+            f"white padding between cells, black empty cells; "
+            f"default: *_virtual_mIF_thumbnail.png)"
         ),
     )
     parser.add_argument(
@@ -91,6 +104,7 @@ def _validate_args(
     input_path: Path,
     output_tif_path: Path,
     snapshot_png_path: Path,
+    thumbnail_png_path: Path,
     batch_size: int,
     workers: int,
     threshold: float | None,
@@ -103,12 +117,17 @@ def _validate_args(
         raise ValueError("Output TIFF path must end with .tif or .tiff")
     if snapshot_png_path.suffix.lower() != ".png":
         raise ValueError("Snapshot PNG path must end with .png")
-    if output_tif_path == input_path:
-        raise ValueError("Output TIFF path must not overwrite the input file")
-    if snapshot_png_path == input_path:
-        raise ValueError("Snapshot PNG path must not overwrite the input file")
-    if output_tif_path == snapshot_png_path:
-        raise ValueError("Output TIFF and snapshot PNG paths must be different")
+    if thumbnail_png_path.suffix.lower() != ".png":
+        raise ValueError("Thumbnail PNG path must end with .png")
+    for label, path in (
+        ("Output TIFF", output_tif_path),
+        ("Snapshot PNG", snapshot_png_path),
+        ("Thumbnail PNG", thumbnail_png_path),
+    ):
+        if path == input_path:
+            raise ValueError(f"{label} path must not overwrite the input file")
+    if len({output_tif_path, snapshot_png_path, thumbnail_png_path}) != 3:
+        raise ValueError("Output TIFF / snapshot PNG / thumbnail PNG paths must all differ")
     if batch_size <= 0:
         raise ValueError("Batch size must be positive")
     if workers < 0:
@@ -130,6 +149,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.snapshot_png
         else _default_snapshot_png_path(input_path)
     )
+    thumbnail_png_path = (
+        args.thumbnail_png.expanduser().resolve()
+        if args.thumbnail_png
+        else _default_thumbnail_png_path(input_path)
+    )
 
     threshold: float | None = None if args.threshold == 0 else float(args.threshold)
 
@@ -138,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
             input_path,
             output_tif_path,
             snapshot_png_path,
+            thumbnail_png_path,
             args.batch_size,
             args.workers,
             args.threshold,
@@ -156,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
             output_tif_path,
             snapshot_png_path,
             args.mag,
+            thumbnail_png_path=thumbnail_png_path,
             batch_size=args.batch_size,
             num_workers=args.workers,
             pin_memory=not args.no_pin_memory,
@@ -169,6 +195,8 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(f"Wrote {result['output_tif_path']}")
     print(f"Wrote {result['snapshot_png_path']}")
+    if result.get("thumbnail_png_path"):
+        print(f"Wrote {result['thumbnail_png_path']}")
     return 0
 
 

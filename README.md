@@ -59,12 +59,13 @@ cd hist2mIF
 uv run hist2mif-cli --file /path/to/input.tif --mag 20x
 # pipeline (per 256x256 inference tile, all cv2.INTER_NEAREST):
 #   sigmoid > threshold   -> binary mask (21, 256, 256)
-#   cv2.resize 1/16       -> mask (21, 16, 16) ──► page in *_virtual_mIF.tif (JPEG q=90)
-#   composite color * 1/21 -> RGB (16, 16, 3)
-#   cv2.resize 1/2        -> RGB (8, 8) ──► tile in *_virtual_mIF_snapshot.png
-# Final outputs:
-#   /path/to/input_virtual_mIF.tif           21 pages, uint8 binary, 1/16 of full scale
-#   /path/to/input_virtual_mIF_snapshot.png  1/32 of full scale + paper color legend
+#   cv2.resize 1/16       -> mask (21, 16, 16) -> mask_buffer (21, H/16, W/16)
+# after the full mask_buffer is assembled:
+#   *_virtual_mIF.tif         21 grayscale pages, uint8, JPEG q=90 (1/16 scale)
+#   *_virtual_mIF_snapshot.png  same 1/16 scale RGB composite (color * 1/21,
+#                               brightness gain) + paper color legend
+#   *_virtual_mIF_thumbnail.png 4x6 grid of per-channel colored masks
+#                               (paper palette, white padding, black empty cells)
 # Reads 256x256 H&E regions on-demand through a DataLoader, runs model
 # inference with batch_size=128, workers=4, pin_memory=True.
 

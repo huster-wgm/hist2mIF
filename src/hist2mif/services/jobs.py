@@ -19,7 +19,13 @@ from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader, Dataset
 
 from hist2mif.core.config import settings
-from hist2mif.domain.channels import CHANNEL_NAMES_23, EXPORT_CHANNELS, legend_entries
+from hist2mif.domain.channels import (
+    CHANNEL_DISPLAY_NAMES,
+    CHANNEL_NAMES_23,
+    EXPORT_CHANNELS,
+    LEGEND_ORDER,
+    legend_entries,
+)
 from hist2mif.services import inference
 
 logger = logging.getLogger(__name__)
@@ -30,15 +36,24 @@ DEFAULT_CLI_PIN_MEMORY = True
 
 # Pipeline scales (all cv2.INTER_NEAREST):
 #   probs (256x256)  --binarize-->  mask (21, 256, 256)
-#       --cv2.resize 1/MASK_TIF_DOWNSAMPLE-->  mask_small (21, 16, 16)  ──►  mIF TIFF
-#       --composite (color * 1/N_export)-->    comp_small (16, 16, 3)
-#       --cv2.resize 1/SNAPSHOT_OF_MASK_RATIO->  comp_snap (8, 8, 3)    ──►  snapshot PNG
-# Effective snapshot scale = MASK_TIF_DOWNSAMPLE * SNAPSHOT_OF_MASK_RATIO (=32).
+#       --cv2.resize 1/MASK_TIF_DOWNSAMPLE NEAREST-->  mask_small (21, 16, 16)
+#   mask_buffer (21, H/16, W/16) is then used to produce:
+#     mIF TIFF      = 21 mask pages, JPEG q=90, same 1/16 resolution
+#     snapshot PNG  = composite(mask_buffer) * brightness gain + paper legend
+#                     (also at 1/16; no extra resize)
+#     thumbnail PNG = 4x6 grid of per-channel colored masks (paper palette)
+#                     with white padding between cells; empty cells are black
 MASK_TIF_DOWNSAMPLE = 16
-SNAPSHOT_OF_MASK_RATIO = 2
 
 # JPEG quality used for the per-channel mask TIFF pages (libjpeg level).
 OUTPUT_JPEG_QUALITY = 90
+
+# Thumbnail grid layout (4 cols x 6 rows = 24 cells; 21 markers + 3 black).
+THUMBNAIL_GRID_COLS = 4
+THUMBNAIL_GRID_ROWS = 6
+THUMBNAIL_CELL_WIDTH = 400
+THUMBNAIL_PADDING = 12
+THUMBNAIL_PAD_COLOR: tuple[int, int, int] = (255, 255, 255)
 
 # Candidate paths probed by _load_font for legend text. Order matters: the
 # first readable TTF wins so the snapshot still renders if a host lacks
@@ -172,13 +187,14 @@ def run_inference_to_tif_and_snapshot(
     snapshot_png_path: Path,
     mag: str,
     *,
+    thumbnail_png_path: Path | None = None,
     batch_size: int = DEFAULT_CLI_BATCH_SIZE,
     num_workers: int = DEFAULT_CLI_NUM_WORKERS,
     pin_memory: bool = DEFAULT_CLI_PIN_MEMORY,
     threshold: float | None = inference.DEFAULT_ACTIVATION_THRESHOLD,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> dict:
-    """Stream tile inference and write a 21-channel binary-mask TIFF + composite PNG."""
+    """Stream tile inference and write a 21-channel binary-mask TIFF + composite PNG + thumbnail grid."""
     if mag not in inference.MAG_INPUT_SIZE:
         raise ValueError(f"Unknown magnification: {mag}")
     if batch_size <= 0:
@@ -196,12 +212,6 @@ def run_inference_to_tif_and_snapshot(
             f"({MASK_TIF_DOWNSAMPLE})"
         )
     mask_block = tile_size // MASK_TIF_DOWNSAMPLE
-    if mask_block % SNAPSHOT_OF_MASK_RATIO != 0:
-        raise ValueError(
-            f"mask_block={mask_block} must be divisible by SNAPSHOT_OF_MASK_RATIO "
-            f"({SNAPSHOT_OF_MASK_RATIO})"
-        )
-    snap_block = mask_block // SNAPSHOT_OF_MASK_RATIO
 
     nh = (h + tile_size - 1) // tile_size
     nw = (w + tile_size - 1) // tile_size
@@ -211,12 +221,14 @@ def run_inference_to_tif_and_snapshot(
     snapshot_png_path.parent.mkdir(parents=True, exist_ok=True)
     output_tif_path.unlink(missing_ok=True)
     snapshot_png_path.unlink(missing_ok=True)
+    if thumbnail_png_path is not None:
+        thumbnail_png_path.parent.mkdir(parents=True, exist_ok=True)
+        thumbnail_png_path.unlink(missing_ok=True)
 
     export_idxs = np.asarray([i for i, _ in EXPORT_CHANNELS], dtype=np.int64)
     channel_names = [CHANNEL_NAMES_23[i] for i in export_idxs]
     n_channels = export_idxs.size
 
-    snapshot = np.zeros((nh * snap_block, nw * snap_block, 3), dtype=np.uint8)
     mask_buffer = np.zeros((n_channels, nh * mask_block, nw * mask_block), dtype=np.uint8)
 
     mask_threshold = float(
@@ -256,39 +268,19 @@ def run_inference_to_tif_and_snapshot(
                 if pw < tile_size:
                     probs_tile[:, :, pw:] = 0.0
 
-                # 1. Binarize 21 export channels.
+                # Binarize 21 export channels then resize 1/MASK_TIF_DOWNSAMPLE.
                 mask_full_chw = (probs_tile[export_idxs] > mask_threshold).astype(np.uint8) * 255
-
-                # 2. Single cv2.INTER_NEAREST resize to 1/MASK_TIF_DOWNSAMPLE.
                 mask_full_hwc = np.ascontiguousarray(mask_full_chw.transpose(1, 2, 0))
                 mask_small_hwc = cv2.resize(
                     mask_full_hwc,
                     (mask_block, mask_block),
                     interpolation=cv2.INTER_NEAREST,
                 )
-                mask_small_chw = mask_small_hwc.transpose(2, 0, 1)
-
-                # 3. Write the per-channel binary mask into the TIFF buffer.
                 mask_buffer[
                     :,
                     yi * mask_block : (yi + 1) * mask_block,
                     xi * mask_block : (xi + 1) * mask_block,
-                ] = mask_small_chw
-
-                # 4. Color composition at 1/MASK_TIF_DOWNSAMPLE
-                #    (each marker contributes color/N_export, no active-channel counting).
-                comp_small = inference.composite_mask_rgb_u8(mask_small_chw)
-
-                # 5. cv2.INTER_NEAREST resize 1/SNAPSHOT_OF_MASK_RATIO to snapshot grid.
-                comp_snap = cv2.resize(
-                    comp_small,
-                    (snap_block, snap_block),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-                snapshot[
-                    yi * snap_block : (yi + 1) * snap_block,
-                    xi * snap_block : (xi + 1) * snap_block,
-                ] = comp_snap
+                ] = mask_small_hwc.transpose(2, 0, 1)
 
                 done += 1
                 if progress_cb is not None:
@@ -305,8 +297,17 @@ def run_inference_to_tif_and_snapshot(
                 metadata={"channel": channel_names[ch_idx], "index": int(ch_idx)},
             )
 
+    # Snapshot: full-resolution (same as mask TIFF) RGB composite + paper legend.
+    snapshot = _composite_full_mask(mask_buffer)
     snapshot_with_legend = _attach_legend(snapshot)
     Image.fromarray(snapshot_with_legend).save(snapshot_png_path)
+
+    # Thumbnail: 4x6 grid of per-channel colored masks with white padding.
+    thumb_hw: list[int] | None = None
+    if thumbnail_png_path is not None:
+        thumbnail = _build_channel_thumbnail(mask_buffer)
+        Image.fromarray(thumbnail).save(thumbnail_png_path)
+        thumb_hw = list(thumbnail.shape[:2])
 
     meta = {
         "input_h": tile_size,
@@ -316,7 +317,7 @@ def run_inference_to_tif_and_snapshot(
         "window_size": inference.WINDOW,
         "grid": [nh, nw],
         "image_hw": [h, w],
-        "snapshot_scale": 1.0 / (MASK_TIF_DOWNSAMPLE * SNAPSHOT_OF_MASK_RATIO),
+        "snapshot_scale": 1.0 / MASK_TIF_DOWNSAMPLE,
         "snapshot_hw": list(snapshot.shape[:2]),
         "output_tif_scale": 1.0 / MASK_TIF_DOWNSAMPLE,
         "output_tif_hw": [mask_buffer.shape[1], mask_buffer.shape[2]],
@@ -324,6 +325,8 @@ def run_inference_to_tif_and_snapshot(
         "output_tif_jpeg_quality": OUTPUT_JPEG_QUALITY,
         "output_tif_channels": channel_names,
         "output_tif_threshold": mask_threshold,
+        "thumbnail_hw": thumb_hw,
+        "thumbnail_grid": [THUMBNAIL_GRID_ROWS, THUMBNAIL_GRID_COLS],
         "downsample": "cv2.INTER_NEAREST",
         "composite_divisor": int(n_channels),
         "batch_size": batch_size,
@@ -334,6 +337,7 @@ def run_inference_to_tif_and_snapshot(
     return {
         "output_tif_path": str(output_tif_path),
         "snapshot_png_path": str(snapshot_png_path),
+        "thumbnail_png_path": str(thumbnail_png_path) if thumbnail_png_path is not None else None,
         "quilt_meta": meta,
     }
 
@@ -413,6 +417,95 @@ def _render_legend(target_height: int) -> np.ndarray:
         draw.text((tx, ty), name, fill=(255, 255, 255), font=font)
 
     return np.array(img, dtype=np.uint8)
+
+
+def _composite_full_mask(mask_buffer: np.ndarray, *, row_chunk: int = 256) -> np.ndarray:
+    """Composite (C, H, W) mask buffer into (H, W, 3) RGB via composite_mask_rgb_u8.
+
+    Row-chunked to bound peak memory: a single ``composite_mask_rgb_u8`` call on
+    a full mask buffer would materialize a ``(C, H, W)`` float32 copy and an
+    ``einsum`` intermediate (both ~2 GB for typical slides), so we slice the
+    height into ``row_chunk`` strips and composite them independently.
+    """
+    _, height, width = mask_buffer.shape
+    snapshot = np.zeros((height, width, 3), dtype=np.uint8)
+    for y0 in range(0, height, row_chunk):
+        y1 = min(y0 + row_chunk, height)
+        snapshot[y0:y1] = inference.composite_mask_rgb_u8(mask_buffer[:, y0:y1, :])
+    return snapshot
+
+
+def _build_channel_thumbnail(
+    mask_buffer: np.ndarray,
+    *,
+    cols: int = THUMBNAIL_GRID_COLS,
+    rows: int = THUMBNAIL_GRID_ROWS,
+    cell_width: int = THUMBNAIL_CELL_WIDTH,
+    padding: int = THUMBNAIL_PADDING,
+    pad_color: tuple[int, int, int] = THUMBNAIL_PAD_COLOR,
+) -> np.ndarray:
+    """Render a cols x rows grid of per-channel masks painted with paper colors.
+
+    Channels are drawn in `LEGEND_ORDER` so the grid reads in the same
+    top-to-bottom order as the snapshot's legend column. Empty cells (when the
+    grid is larger than the channel count) are filled black so the surrounding
+    white padding still reads as a "between cells" separator.
+    """
+    n_channels, full_h, full_w = mask_buffer.shape
+    if full_h == 0 or full_w == 0:
+        raise ValueError("mask buffer must have non-zero spatial extent")
+
+    cell_h = max(1, int(round(cell_width * full_h / full_w)))
+    grid_w = cols * cell_width + (cols + 1) * padding
+    grid_h = rows * cell_h + (rows + 1) * padding
+    grid = np.full((grid_h, grid_w, 3), pad_color, dtype=np.uint8)
+
+    pal_u8 = (inference.get_export_palette() * 255.0).astype(np.uint8)  # (C, 3)
+    name_to_pos = {CHANNEL_NAMES_23[i]: pos for pos, (i, _) in enumerate(EXPORT_CHANNELS)}
+    ordered = [(name, name_to_pos[name]) for name in LEGEND_ORDER if name in name_to_pos]
+
+    font_size = max(12, cell_h // 18)
+    font = _load_font(font_size)
+    text_pad = max(4, padding // 2)
+
+    for cell_idx in range(rows * cols):
+        r, c = divmod(cell_idx, cols)
+        y0 = padding + r * (cell_h + padding)
+        x0 = padding + c * (cell_width + padding)
+        y1 = y0 + cell_h
+        x1 = x0 + cell_width
+
+        if cell_idx >= len(ordered):
+            grid[y0:y1, x0:x1] = 0
+            continue
+
+        display_name, ch_pos = ordered[cell_idx]
+        label = CHANNEL_DISPLAY_NAMES.get(display_name, display_name)
+
+        mask = mask_buffer[ch_pos]
+        cell_mask = cv2.resize(mask, (cell_width, cell_h), interpolation=cv2.INTER_NEAREST)
+        cell = np.zeros((cell_h, cell_width, 3), dtype=np.uint8)
+        cell[cell_mask > 127] = pal_u8[ch_pos]
+
+        # Draw a small swatch + label in the top-left so each cell self-identifies.
+        cell_img = Image.fromarray(cell)
+        draw = ImageDraw.Draw(cell_img)
+        swatch = max(font_size, 16)
+        draw.rectangle(
+            [text_pad, text_pad, text_pad + swatch, text_pad + swatch],
+            fill=tuple(int(v) for v in pal_u8[ch_pos]),
+            outline=(255, 255, 255),
+            width=1,
+        )
+        draw.text(
+            (text_pad + swatch + text_pad, text_pad - 2),
+            label,
+            fill=(255, 255, 255),
+            font=font,
+        )
+        grid[y0:y1, x0:x1] = np.asarray(cell_img, dtype=np.uint8)
+
+    return grid
 
 
 def _attach_legend(snapshot: np.ndarray) -> np.ndarray:
