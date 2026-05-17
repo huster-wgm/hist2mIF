@@ -10,6 +10,7 @@ dependencies = [
   "huggingface_hub>=0.26.0",
   "imageio>=2.34.0",
   "numpy>=2.0.0,<3",
+  "opencv-python-headless>=4.10.0,<5",
   "pillow>=10.4.0",
   "pyyaml>=6.0.0",
   "tifffile>=2024.8.0",

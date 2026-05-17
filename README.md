@@ -59,10 +59,12 @@ cd hist2mIF
 uv run hist2mif-cli --file /path/to/input.tif --mag 20x
 # writes:
 #   /path/to/input_virtual_mIF.tif           21-channel binary mask, uint8,
-#                                            1/20 scale, JPEG q=90, one page per marker
-#   /path/to/input_virtual_mIF_snapshot.png  1/50 scale composite + paper color legend
+#                                            1/16 scale, JPEG q=90, one page per marker
+#   /path/to/input_virtual_mIF_snapshot.png  1/32 scale composite + paper color legend
 # reads 256x256 TIFF regions directly through a DataLoader
-# and runs model inference with batch_size=128, workers=4, pin_memory=True
+# and runs model inference with batch_size=128, workers=4, pin_memory=True.
+# Per-tile downsampling uses cv2.resize with INTER_NEAREST after binarization,
+# so each 256x256 inference tile becomes a 16x16 mask block and an 8x8 snapshot block.
 
 uv run hist2mif-cli --file /path/to/input.tiff --mag 10x \
   --output-tif /path/to/output.tif \

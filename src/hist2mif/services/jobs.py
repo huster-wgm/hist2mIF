@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+import cv2
 import numpy as np
 import torch
 import tifffile
@@ -27,14 +28,12 @@ DEFAULT_CLI_BATCH_SIZE = 128
 DEFAULT_CLI_NUM_WORKERS = 4
 DEFAULT_CLI_PIN_MEMORY = True
 
-# CLI composite snapshot PNG is written at 1/SNAPSHOT_STEP of the slide so
-# whole-slide overviews fit comfortably in a single image with the legend.
-SNAPSHOT_STEP = 50
-
-# Multi-channel binary-mask TIFF is kept at higher fidelity (1/MASK_TIF_STEP)
-# so it remains usable for downstream per-marker analysis while staying small
-# enough to ship as a normal JPEG TIFF instead of a multi-gigabyte BigTIFF.
-MASK_TIF_STEP = 20
+# Per-tile nearest-neighbor downsample ratios applied with cv2.resize after the
+# 256x256 model output is binarized / composited. Each inference tile produces a
+# fixed-size block that is tiled into the global output buffer, so output sizes
+# are deterministic multiples of the slide's tile grid.
+SNAPSHOT_DOWNSAMPLE = 32  # 256 / 32 = 8 px per inference tile in the snapshot PNG
+MASK_TIF_DOWNSAMPLE = 16  # 256 / 16 = 16 px per inference tile in the mask TIFF
 
 # JPEG quality used for the per-channel mask TIFF pages (libjpeg level).
 OUTPUT_JPEG_QUALITY = 90
@@ -189,6 +188,11 @@ def run_inference_to_tif_and_snapshot(
 
     h, w = inference.get_he_image_shape(src_path)
     tile_size = inference.MAG_INPUT_SIZE[mag]
+    if tile_size % SNAPSHOT_DOWNSAMPLE != 0 or tile_size % MASK_TIF_DOWNSAMPLE != 0:
+        raise ValueError(
+            f"tile_size={tile_size} must be divisible by both SNAPSHOT_DOWNSAMPLE "
+            f"({SNAPSHOT_DOWNSAMPLE}) and MASK_TIF_DOWNSAMPLE ({MASK_TIF_DOWNSAMPLE})"
+        )
     nh = (h + tile_size - 1) // tile_size
     nw = (w + tile_size - 1) // tile_size
     total = nh * nw
@@ -202,14 +206,11 @@ def run_inference_to_tif_and_snapshot(
     channel_names = [CHANNEL_NAMES_23[i] for i in export_idxs]
     n_channels = export_idxs.size
 
-    mask_h = (h + MASK_TIF_STEP - 1) // MASK_TIF_STEP
-    mask_w = (w + MASK_TIF_STEP - 1) // MASK_TIF_STEP
-    mask_buffer = np.zeros((n_channels, mask_h, mask_w), dtype=np.uint8)
+    snap_block = tile_size // SNAPSHOT_DOWNSAMPLE
+    mask_block = tile_size // MASK_TIF_DOWNSAMPLE
 
-    snapshot = np.zeros(
-        ((h + SNAPSHOT_STEP - 1) // SNAPSHOT_STEP, (w + SNAPSHOT_STEP - 1) // SNAPSHOT_STEP, 3),
-        dtype=np.uint8,
-    )
+    snapshot = np.zeros((nh * snap_block, nw * snap_block, 3), dtype=np.uint8)
+    mask_buffer = np.zeros((n_channels, nh * mask_block, nw * mask_block), dtype=np.uint8)
 
     mask_threshold = float(
         threshold if threshold is not None else inference.DEFAULT_ACTIVATION_THRESHOLD
@@ -239,17 +240,43 @@ def run_inference_to_tif_and_snapshot(
                 x0 = int(x0s[i])
                 ph = int(phs[i])
                 pw = int(pws[i])
-                probs_tile = probs_batch[i, :, :ph, :pw]
+                yi = y0 // tile_size
+                xi = x0 // tile_size
 
-                comp = inference.composite_virtual_mif_rgb_u8(
+                probs_tile = probs_batch[i]  # (23, tile_size, tile_size)
+                if ph < tile_size:
+                    probs_tile[:, ph:, :] = 0.0
+                if pw < tile_size:
+                    probs_tile[:, :, pw:] = 0.0
+
+                comp_full = inference.composite_virtual_mif_rgb_u8(
                     probs_tile,
                     rescale=False,
                     threshold=threshold,
+                )  # (tile_size, tile_size, 3)
+                comp_small = cv2.resize(
+                    comp_full,
+                    (snap_block, snap_block),
+                    interpolation=cv2.INTER_NEAREST,
                 )
-                _write_snapshot_region(snapshot, comp, y0, x0)
+                snapshot[
+                    yi * snap_block : (yi + 1) * snap_block,
+                    xi * snap_block : (xi + 1) * snap_block,
+                ] = comp_small
 
-                mask_tile = (probs_tile[export_idxs] > mask_threshold).astype(np.uint8) * 255
-                _write_mask_region(mask_buffer, mask_tile, y0, x0, MASK_TIF_STEP)
+                mask_tile_chw = (probs_tile[export_idxs] > mask_threshold).astype(np.uint8) * 255
+                mask_tile_hwc = np.ascontiguousarray(mask_tile_chw.transpose(1, 2, 0))
+                mask_small_hwc = cv2.resize(
+                    mask_tile_hwc,
+                    (mask_block, mask_block),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                mask_small_chw = mask_small_hwc.transpose(2, 0, 1)
+                mask_buffer[
+                    :,
+                    yi * mask_block : (yi + 1) * mask_block,
+                    xi * mask_block : (xi + 1) * mask_block,
+                ] = mask_small_chw
 
                 done += 1
                 if progress_cb is not None:
@@ -277,12 +304,15 @@ def run_inference_to_tif_and_snapshot(
         "window_size": inference.WINDOW,
         "grid": [nh, nw],
         "image_hw": [h, w],
-        "snapshot_scale": 1.0 / SNAPSHOT_STEP,
-        "output_tif_scale": 1.0 / MASK_TIF_STEP,
+        "snapshot_scale": 1.0 / SNAPSHOT_DOWNSAMPLE,
+        "snapshot_hw": list(snapshot.shape[:2]),
+        "output_tif_scale": 1.0 / MASK_TIF_DOWNSAMPLE,
+        "output_tif_hw": [mask_buffer.shape[1], mask_buffer.shape[2]],
         "output_tif_compression": "jpeg",
         "output_tif_jpeg_quality": OUTPUT_JPEG_QUALITY,
         "output_tif_channels": channel_names,
         "output_tif_threshold": mask_threshold,
+        "downsample": "cv2.INTER_NEAREST",
         "batch_size": batch_size,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
@@ -384,45 +414,6 @@ def _attach_legend(snapshot: np.ndarray) -> np.ndarray:
     canvas[:h_snap, :w_snap, :] = snapshot
     canvas[:h_leg, w_snap : w_snap + w_leg, :] = legend
     return canvas
-
-
-def _write_snapshot_region(
-    snapshot: np.ndarray,
-    comp: np.ndarray,
-    y0: int,
-    x0: int,
-) -> None:
-    ph, pw = comp.shape[:2]
-    ys = np.arange(y0, y0 + ph)
-    xs = np.arange(x0, x0 + pw)
-    keep_y = ys[ys % SNAPSHOT_STEP == 0]
-    keep_x = xs[xs % SNAPSHOT_STEP == 0]
-    if keep_y.size == 0 or keep_x.size == 0:
-        return
-    tile_y = keep_y - y0
-    tile_x = keep_x - x0
-    snapshot[np.ix_(keep_y // SNAPSHOT_STEP, keep_x // SNAPSHOT_STEP)] = comp[np.ix_(tile_y, tile_x)]
-
-
-def _write_mask_region(
-    buffer: np.ndarray,
-    tile: np.ndarray,
-    y0: int,
-    x0: int,
-    step: int,
-) -> None:
-    """Stride-sample a (C, ph, pw) tile into a (C, H, W) buffer at integer step."""
-    _, ph, pw = tile.shape
-    ys = np.arange(y0, y0 + ph)
-    xs = np.arange(x0, x0 + pw)
-    sel_y = np.where(ys % step == 0)[0]
-    sel_x = np.where(xs % step == 0)[0]
-    if sel_y.size == 0 or sel_x.size == 0:
-        return
-    dst_y0 = int(ys[sel_y[0]] // step)
-    dst_x0 = int(xs[sel_x[0]] // step)
-    src = tile[:, sel_y, :][:, :, sel_x]
-    buffer[:, dst_y0 : dst_y0 + sel_y.size, dst_x0 : dst_x0 + sel_x.size] = src
 
 
 def _run_job_worker(job_id: str, saved_input: Path, mag: str) -> None:

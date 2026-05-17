@@ -20,8 +20,8 @@ def _build_parser() -> argparse.ArgumentParser:
     from hist2mif.services.jobs import (
         DEFAULT_CLI_BATCH_SIZE,
         DEFAULT_CLI_NUM_WORKERS,
-        MASK_TIF_STEP,
-        SNAPSHOT_STEP,
+        MASK_TIF_DOWNSAMPLE,
+        SNAPSHOT_DOWNSAMPLE,
     )
 
     parser = argparse.ArgumentParser(
@@ -39,17 +39,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output-tif",
         type=Path,
         help=(
-            f"21-channel binary-mask TIFF at 1/{MASK_TIF_STEP} scale "
-            f"(JPEG-compressed, one grayscale uint8 page per marker; "
-            f"default: *_virtual_mIF.tif)"
+            f"21-channel binary-mask TIFF at 1/{MASK_TIF_DOWNSAMPLE} scale "
+            f"(JPEG-compressed, one grayscale uint8 page per marker, cv2.INTER_NEAREST "
+            f"per-tile resize; default: *_virtual_mIF.tif)"
         ),
     )
     parser.add_argument(
         "--snapshot-png",
         type=Path,
         help=(
-            f"1/{SNAPSHOT_STEP} scale PNG snapshot with marker legend "
-            f"(default: *_virtual_mIF_snapshot.png)"
+            f"1/{SNAPSHOT_DOWNSAMPLE} scale PNG snapshot with marker legend "
+            f"(cv2.INTER_NEAREST per-tile resize; "
+            f"default: *_virtual_mIF_snapshot.png)"
         ),
     )
     parser.add_argument(

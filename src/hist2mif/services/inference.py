@@ -120,15 +120,17 @@ def composite_virtual_mif_rgb_u8(
 
     Follows the paper's binary-activation interpretation
     (`scripts/gigatime_testing.ipynb`): a pixel is "active" for channel c iff
-    ``sigmoid(logits[c]) > threshold``. Each active pixel is painted with that
-    channel's color from `CHANNEL_COLORS_RGB`, and channels are combined via a
-    per-pixel max across (mask * color). Pixels with no active marker stay
-    black, which gives the dark background + colored markers look of the paper
-    Figure 1A/2D / 3H virtual mIF panels.
+    ``sigmoid(logits[c]) > threshold``. Active markers contribute their
+    ``CHANNEL_COLORS_RGB`` color to the pixel with **equal weight** — i.e.
+    the output is the arithmetic mean of the colors of all active channels at
+    that pixel. Pixels with no active marker stay black, mirroring the dark
+    background of the paper virtual-mIF panels; pixels with a single active
+    marker show that marker's exact paper color; pixels with multiple active
+    markers show the equal-weight average of those colors.
 
-    Pass ``threshold=None`` to skip binarization and blend continuous
-    probabilities directly (use only for sanity checks; the result will
-    typically wash out because the model is over-confident on H&E).
+    Pass ``threshold=None`` to use continuous sigmoid probabilities as the
+    blending weights (each channel contributes ``prob[c] * color[c]`` and the
+    pixel is normalized by ``sum(probs)``).
 
     Background channels TRITC/Cy5 are excluded via EXPORT_CHANNELS.
     """
@@ -140,11 +142,11 @@ def composite_virtual_mif_rgb_u8(
         sel = (sel > float(threshold)).astype(np.float32)
     pal = get_export_palette()  # (C, 3) in [0, 1]
 
-    h, w = sel.shape[1], sel.shape[2]
-    rgb = np.zeros((h, w, 3), dtype=np.float32)
-    for c in range(sel.shape[0]):
-        contrib = sel[c, :, :, None] * pal[c, None, None, :]
-        np.maximum(rgb, contrib, out=rgb)
+    weighted_sum = np.einsum("chw,cj->hwj", sel, pal)  # (H, W, 3)
+    total_weight = sel.sum(axis=0)  # (H, W)
+    safe_weight = np.maximum(total_weight, 1e-6)[..., None]
+    rgb = weighted_sum / safe_weight
+    rgb = np.where(total_weight[..., None] > 0, rgb, 0.0)
 
     mx = float(rgb.max())
     if rescale and mx > 1e-6:
