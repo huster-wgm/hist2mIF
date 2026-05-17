@@ -302,10 +302,14 @@ def run_inference_to_tif_and_snapshot(
     snapshot_with_legend = _attach_legend(snapshot)
     Image.fromarray(snapshot_with_legend).save(snapshot_png_path)
 
-    # Thumbnail: 4x6 grid of per-channel colored masks with white padding.
+    # Thumbnail: H&E cell + per-channel colored masks on a 6x4 grid.
     thumb_hw: list[int] | None = None
     if thumbnail_png_path is not None:
-        thumbnail = _build_channel_thumbnail(mask_buffer)
+        mask_h, mask_w = mask_buffer.shape[1], mask_buffer.shape[2]
+        cell_w = THUMBNAIL_CELL_WIDTH
+        cell_h = max(1, int(round(cell_w * mask_h / mask_w)))
+        he_thumb = _load_he_thumbnail(src_path, cell_w, cell_h)
+        thumbnail = _build_channel_thumbnail(mask_buffer, he_thumbnail=he_thumb)
         Image.fromarray(thumbnail).save(thumbnail_png_path)
         thumb_hw = list(thumbnail.shape[:2])
 
@@ -435,9 +439,56 @@ def _composite_full_mask(mask_buffer: np.ndarray, *, row_chunk: int = 256) -> np
     return snapshot
 
 
+def _load_he_thumbnail(src_path: Path, target_w: int, target_h: int) -> np.ndarray | None:
+    """Load the source H&E slide at a small pyramid level and resize to (target_h, target_w).
+
+    Returns None if the slide can't be decoded into RGB; callers should treat
+    None as "skip the H&E cell and leave it black".
+    """
+    try:
+        rgb = inference.load_he_image(src_path, max_side=max(target_w, target_h))
+    except Exception:
+        logger.exception("Failed to load H&E thumbnail from %s", src_path)
+        return None
+    return cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+
+def _draw_cell_label(
+    cell: np.ndarray,
+    label: str,
+    *,
+    swatch_color: tuple[int, int, int] | None,
+    font: ImageFont.ImageFont,
+    text_pad: int,
+    swatch: int,
+) -> np.ndarray:
+    """Overlay a small color swatch (optional) + text label on the top-left of a cell."""
+    img = Image.fromarray(cell)
+    draw = ImageDraw.Draw(img)
+    if swatch_color is not None:
+        draw.rectangle(
+            [text_pad, text_pad, text_pad + swatch, text_pad + swatch],
+            fill=swatch_color,
+            outline=(255, 255, 255),
+            width=1,
+        )
+        text_x = text_pad + swatch + text_pad
+    else:
+        text_x = text_pad
+    bbox = font.getbbox(label)
+    text_h = bbox[3] - bbox[1]
+    # Outline the text in black so it stays readable on bright H&E pink/white.
+    text_y = text_pad - bbox[1]
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        draw.text((text_x + dx, text_y + dy), label, fill=(0, 0, 0), font=font)
+    draw.text((text_x, text_y), label, fill=(255, 255, 255), font=font)
+    return np.asarray(img, dtype=np.uint8)
+
+
 def _build_channel_thumbnail(
     mask_buffer: np.ndarray,
     *,
+    he_thumbnail: np.ndarray | None = None,
     cols: int = THUMBNAIL_GRID_COLS,
     rows: int = THUMBNAIL_GRID_ROWS,
     cell_width: int = THUMBNAIL_CELL_WIDTH,
@@ -446,10 +497,12 @@ def _build_channel_thumbnail(
 ) -> np.ndarray:
     """Render a cols x rows grid of per-channel masks painted with paper colors.
 
-    Channels are drawn in `LEGEND_ORDER` so the grid reads in the same
-    top-to-bottom order as the snapshot's legend column. Empty cells (when the
-    grid is larger than the channel count) are filled black so the surrounding
-    white padding still reads as a "between cells" separator.
+    When ``he_thumbnail`` is provided, the first cell shows the source H&E
+    thumbnail labelled ``H&E`` and the 21 markers shift to cells 1..21. Markers
+    are drawn in `LEGEND_ORDER` so the grid reads in the same top-to-bottom
+    order as the snapshot's legend column. Cells beyond the populated entries
+    are filled black so the surrounding white padding still reads as a
+    "between cells" separator.
     """
     n_channels, full_h, full_w = mask_buffer.shape
     if full_h == 0 or full_w == 0:
@@ -467,6 +520,9 @@ def _build_channel_thumbnail(
     font_size = max(12, cell_h // 18)
     font = _load_font(font_size)
     text_pad = max(4, padding // 2)
+    swatch = max(font_size, 16)
+
+    he_offset = 1 if he_thumbnail is not None else 0
 
     for cell_idx in range(rows * cols):
         r, c = divmod(cell_idx, cols)
@@ -475,35 +531,38 @@ def _build_channel_thumbnail(
         y1 = y0 + cell_h
         x1 = x0 + cell_width
 
-        if cell_idx >= len(ordered):
+        if he_thumbnail is not None and cell_idx == 0:
+            he_cell = cv2.resize(he_thumbnail, (cell_width, cell_h), interpolation=cv2.INTER_AREA)
+            grid[y0:y1, x0:x1] = _draw_cell_label(
+                he_cell,
+                "H&E",
+                swatch_color=None,
+                font=font,
+                text_pad=text_pad,
+                swatch=swatch,
+            )
+            continue
+
+        channel_idx = cell_idx - he_offset
+        if channel_idx >= len(ordered):
             grid[y0:y1, x0:x1] = 0
             continue
 
-        display_name, ch_pos = ordered[cell_idx]
+        display_name, ch_pos = ordered[channel_idx]
         label = CHANNEL_DISPLAY_NAMES.get(display_name, display_name)
 
         mask = mask_buffer[ch_pos]
         cell_mask = cv2.resize(mask, (cell_width, cell_h), interpolation=cv2.INTER_NEAREST)
         cell = np.zeros((cell_h, cell_width, 3), dtype=np.uint8)
         cell[cell_mask > 127] = pal_u8[ch_pos]
-
-        # Draw a small swatch + label in the top-left so each cell self-identifies.
-        cell_img = Image.fromarray(cell)
-        draw = ImageDraw.Draw(cell_img)
-        swatch = max(font_size, 16)
-        draw.rectangle(
-            [text_pad, text_pad, text_pad + swatch, text_pad + swatch],
-            fill=tuple(int(v) for v in pal_u8[ch_pos]),
-            outline=(255, 255, 255),
-            width=1,
-        )
-        draw.text(
-            (text_pad + swatch + text_pad, text_pad - 2),
+        grid[y0:y1, x0:x1] = _draw_cell_label(
+            cell,
             label,
-            fill=(255, 255, 255),
+            swatch_color=tuple(int(v) for v in pal_u8[ch_pos]),
             font=font,
+            text_pad=text_pad,
+            swatch=swatch,
         )
-        grid[y0:y1, x0:x1] = np.asarray(cell_img, dtype=np.uint8)
 
     return grid
 
