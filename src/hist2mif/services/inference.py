@@ -40,7 +40,7 @@ DEFAULT_ACTIVATION_THRESHOLD = 0.5
 # fires 4-6 of the 21 channels, so the raw composite ends up quite dim
 # (~20-30% brightness). A gentle global gain brings the snapshot closer to the
 # paper figure exposure without breaking the per-channel color identities.
-COMPOSITE_BRIGHTNESS_GAIN = 1.5
+COMPOSITE_BRIGHTNESS_GAIN = 4.0
 
 # GigaTIME model forward operates on 256x256 windows. For whole-slide CLI
 # inference, read those 256x256 regions directly from TIFF instead of resizing
