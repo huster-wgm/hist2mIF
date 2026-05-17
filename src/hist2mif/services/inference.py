@@ -35,6 +35,13 @@ DEFAULT_INPUT_HW = WINDOW
 # per-marker color look.
 DEFAULT_ACTIVATION_THRESHOLD = 0.5
 
+# Multiplier applied to the composited RGB before clipping to [0, 1]. With the
+# fixed 1/N_export divisor in composite_mask_rgb_u8 a typical tissue pixel only
+# fires 4-6 of the 21 channels, so the raw composite ends up quite dim
+# (~20-30% brightness). A gentle global gain brings the snapshot closer to the
+# paper figure exposure without breaking the per-channel color identities.
+COMPOSITE_BRIGHTNESS_GAIN = 1.2
+
 # GigaTIME model forward operates on 256x256 windows. For whole-slide CLI
 # inference, read those 256x256 regions directly from TIFF instead of resizing
 # larger tiles and splitting them again.
@@ -143,6 +150,7 @@ def composite_mask_rgb_u8(
     mask_chw: npt.NDArray[np.floating | np.integer],
     *,
     rescale: bool = False,
+    brightness_gain: float = COMPOSITE_BRIGHTNESS_GAIN,
 ) -> npt.NDArray[np.uint8]:
     """Composite a (C=21, H, W) per-marker mask into an (H, W, 3) RGB blend.
 
@@ -150,7 +158,8 @@ def composite_mask_rgb_u8(
     [0, 1]; values are normalized to [0, 1] internally. Each marker
     contributes ``color[c] / C`` (fixed divisor — no per-pixel active-channel
     counting), so pixel brightness reflects how many markers fire there
-    rather than which one is strongest.
+    rather than which one is strongest. ``brightness_gain`` is applied to the
+    blended RGB before the final clip to [0, 1].
     """
     pal = get_export_palette()  # (C, 3) in [0, 1]
     if mask_chw.shape[0] != pal.shape[0]:
@@ -167,6 +176,8 @@ def composite_mask_rgb_u8(
         mx = float(rgb.max())
         if mx > 1e-6:
             rgb = rgb / mx
+    if brightness_gain != 1.0:
+        rgb = rgb * float(brightness_gain)
     return (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
