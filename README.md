@@ -57,14 +57,16 @@ Local one-shot CLI:
 ```bash
 cd hist2mIF
 uv run hist2mif-cli --file /path/to/input.tif --mag 20x
-# writes:
-#   /path/to/input_virtual_mIF.tif           21-channel binary mask, uint8,
-#                                            1/16 scale, JPEG q=90, one page per marker
-#   /path/to/input_virtual_mIF_snapshot.png  1/32 scale composite + paper color legend
-# reads 256x256 TIFF regions directly through a DataLoader
-# and runs model inference with batch_size=128, workers=4, pin_memory=True.
-# Per-tile downsampling uses cv2.resize with INTER_NEAREST after binarization,
-# so each 256x256 inference tile becomes a 16x16 mask block and an 8x8 snapshot block.
+# pipeline (per 256x256 inference tile, all cv2.INTER_NEAREST):
+#   sigmoid > threshold   -> binary mask (21, 256, 256)
+#   cv2.resize 1/16       -> mask (21, 16, 16) ──► page in *_virtual_mIF.tif (JPEG q=90)
+#   composite color * 1/21 -> RGB (16, 16, 3)
+#   cv2.resize 1/2        -> RGB (8, 8) ──► tile in *_virtual_mIF_snapshot.png
+# Final outputs:
+#   /path/to/input_virtual_mIF.tif           21 pages, uint8 binary, 1/16 of full scale
+#   /path/to/input_virtual_mIF_snapshot.png  1/32 of full scale + paper color legend
+# Reads 256x256 H&E regions on-demand through a DataLoader, runs model
+# inference with batch_size=128, workers=4, pin_memory=True.
 
 uv run hist2mif-cli --file /path/to/input.tiff --mag 10x \
   --output-tif /path/to/output.tif \

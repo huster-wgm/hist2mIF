@@ -28,12 +28,14 @@ DEFAULT_CLI_BATCH_SIZE = 128
 DEFAULT_CLI_NUM_WORKERS = 4
 DEFAULT_CLI_PIN_MEMORY = True
 
-# Per-tile nearest-neighbor downsample ratios applied with cv2.resize after the
-# 256x256 model output is binarized / composited. Each inference tile produces a
-# fixed-size block that is tiled into the global output buffer, so output sizes
-# are deterministic multiples of the slide's tile grid.
-SNAPSHOT_DOWNSAMPLE = 32  # 256 / 32 = 8 px per inference tile in the snapshot PNG
-MASK_TIF_DOWNSAMPLE = 16  # 256 / 16 = 16 px per inference tile in the mask TIFF
+# Pipeline scales (all cv2.INTER_NEAREST):
+#   probs (256x256)  --binarize-->  mask (21, 256, 256)
+#       --cv2.resize 1/MASK_TIF_DOWNSAMPLE-->  mask_small (21, 16, 16)  ──►  mIF TIFF
+#       --composite (color * 1/N_export)-->    comp_small (16, 16, 3)
+#       --cv2.resize 1/SNAPSHOT_OF_MASK_RATIO->  comp_snap (8, 8, 3)    ──►  snapshot PNG
+# Effective snapshot scale = MASK_TIF_DOWNSAMPLE * SNAPSHOT_OF_MASK_RATIO (=32).
+MASK_TIF_DOWNSAMPLE = 16
+SNAPSHOT_OF_MASK_RATIO = 2
 
 # JPEG quality used for the per-channel mask TIFF pages (libjpeg level).
 OUTPUT_JPEG_QUALITY = 90
@@ -188,11 +190,19 @@ def run_inference_to_tif_and_snapshot(
 
     h, w = inference.get_he_image_shape(src_path)
     tile_size = inference.MAG_INPUT_SIZE[mag]
-    if tile_size % SNAPSHOT_DOWNSAMPLE != 0 or tile_size % MASK_TIF_DOWNSAMPLE != 0:
+    if tile_size % MASK_TIF_DOWNSAMPLE != 0:
         raise ValueError(
-            f"tile_size={tile_size} must be divisible by both SNAPSHOT_DOWNSAMPLE "
-            f"({SNAPSHOT_DOWNSAMPLE}) and MASK_TIF_DOWNSAMPLE ({MASK_TIF_DOWNSAMPLE})"
+            f"tile_size={tile_size} must be divisible by MASK_TIF_DOWNSAMPLE "
+            f"({MASK_TIF_DOWNSAMPLE})"
         )
+    mask_block = tile_size // MASK_TIF_DOWNSAMPLE
+    if mask_block % SNAPSHOT_OF_MASK_RATIO != 0:
+        raise ValueError(
+            f"mask_block={mask_block} must be divisible by SNAPSHOT_OF_MASK_RATIO "
+            f"({SNAPSHOT_OF_MASK_RATIO})"
+        )
+    snap_block = mask_block // SNAPSHOT_OF_MASK_RATIO
+
     nh = (h + tile_size - 1) // tile_size
     nw = (w + tile_size - 1) // tile_size
     total = nh * nw
@@ -205,9 +215,6 @@ def run_inference_to_tif_and_snapshot(
     export_idxs = np.asarray([i for i, _ in EXPORT_CHANNELS], dtype=np.int64)
     channel_names = [CHANNEL_NAMES_23[i] for i in export_idxs]
     n_channels = export_idxs.size
-
-    snap_block = tile_size // SNAPSHOT_DOWNSAMPLE
-    mask_block = tile_size // MASK_TIF_DOWNSAMPLE
 
     snapshot = np.zeros((nh * snap_block, nw * snap_block, 3), dtype=np.uint8)
     mask_buffer = np.zeros((n_channels, nh * mask_block, nw * mask_block), dtype=np.uint8)
@@ -249,34 +256,39 @@ def run_inference_to_tif_and_snapshot(
                 if pw < tile_size:
                     probs_tile[:, :, pw:] = 0.0
 
-                comp_full = inference.composite_virtual_mif_rgb_u8(
-                    probs_tile,
-                    rescale=False,
-                    threshold=threshold,
-                )  # (tile_size, tile_size, 3)
-                comp_small = cv2.resize(
-                    comp_full,
+                # 1. Binarize 21 export channels.
+                mask_full_chw = (probs_tile[export_idxs] > mask_threshold).astype(np.uint8) * 255
+
+                # 2. Single cv2.INTER_NEAREST resize to 1/MASK_TIF_DOWNSAMPLE.
+                mask_full_hwc = np.ascontiguousarray(mask_full_chw.transpose(1, 2, 0))
+                mask_small_hwc = cv2.resize(
+                    mask_full_hwc,
+                    (mask_block, mask_block),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                mask_small_chw = mask_small_hwc.transpose(2, 0, 1)
+
+                # 3. Write the per-channel binary mask into the TIFF buffer.
+                mask_buffer[
+                    :,
+                    yi * mask_block : (yi + 1) * mask_block,
+                    xi * mask_block : (xi + 1) * mask_block,
+                ] = mask_small_chw
+
+                # 4. Color composition at 1/MASK_TIF_DOWNSAMPLE
+                #    (each marker contributes color/N_export, no active-channel counting).
+                comp_small = inference.composite_mask_rgb_u8(mask_small_chw)
+
+                # 5. cv2.INTER_NEAREST resize 1/SNAPSHOT_OF_MASK_RATIO to snapshot grid.
+                comp_snap = cv2.resize(
+                    comp_small,
                     (snap_block, snap_block),
                     interpolation=cv2.INTER_NEAREST,
                 )
                 snapshot[
                     yi * snap_block : (yi + 1) * snap_block,
                     xi * snap_block : (xi + 1) * snap_block,
-                ] = comp_small
-
-                mask_tile_chw = (probs_tile[export_idxs] > mask_threshold).astype(np.uint8) * 255
-                mask_tile_hwc = np.ascontiguousarray(mask_tile_chw.transpose(1, 2, 0))
-                mask_small_hwc = cv2.resize(
-                    mask_tile_hwc,
-                    (mask_block, mask_block),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-                mask_small_chw = mask_small_hwc.transpose(2, 0, 1)
-                mask_buffer[
-                    :,
-                    yi * mask_block : (yi + 1) * mask_block,
-                    xi * mask_block : (xi + 1) * mask_block,
-                ] = mask_small_chw
+                ] = comp_snap
 
                 done += 1
                 if progress_cb is not None:
@@ -304,7 +316,7 @@ def run_inference_to_tif_and_snapshot(
         "window_size": inference.WINDOW,
         "grid": [nh, nw],
         "image_hw": [h, w],
-        "snapshot_scale": 1.0 / SNAPSHOT_DOWNSAMPLE,
+        "snapshot_scale": 1.0 / (MASK_TIF_DOWNSAMPLE * SNAPSHOT_OF_MASK_RATIO),
         "snapshot_hw": list(snapshot.shape[:2]),
         "output_tif_scale": 1.0 / MASK_TIF_DOWNSAMPLE,
         "output_tif_hw": [mask_buffer.shape[1], mask_buffer.shape[2]],
@@ -313,6 +325,7 @@ def run_inference_to_tif_and_snapshot(
         "output_tif_channels": channel_names,
         "output_tif_threshold": mask_threshold,
         "downsample": "cv2.INTER_NEAREST",
+        "composite_divisor": int(n_channels),
         "batch_size": batch_size,
         "num_workers": num_workers,
         "pin_memory": pin_memory,

@@ -116,23 +116,19 @@ def composite_virtual_mif_rgb_u8(
     rescale: bool = False,
     threshold: float | None = DEFAULT_ACTIVATION_THRESHOLD,
 ) -> npt.NDArray[np.uint8]:
-    """Blend exported marker probabilities into one RGB image (H, W, 3) uint8.
+    """Composite (23, H, W) probabilities into an (H, W, 3) RGB blend.
 
-    Follows the paper's binary-activation interpretation
-    (`scripts/gigatime_testing.ipynb`): a pixel is "active" for channel c iff
-    ``sigmoid(logits[c]) > threshold``. Active markers contribute their
-    ``CHANNEL_COLORS_RGB`` color to the pixel with **equal weight** — i.e.
-    the output is the arithmetic mean of the colors of all active channels at
-    that pixel. Pixels with no active marker stay black, mirroring the dark
-    background of the paper virtual-mIF panels; pixels with a single active
-    marker show that marker's exact paper color; pixels with multiple active
-    markers show the equal-weight average of those colors.
+    Each of the 21 exported markers contributes ``color[c] / N_EXPORT`` per
+    active pixel (fixed divisor, no per-pixel active-channel counting). The
+    final pixel brightness scales with how many markers fire at that location:
+    no active markers → black, one active marker → that color attenuated to
+    1/21 of full intensity, all 21 active → the equal-weight average of every
+    paper color. This matches the paper's binary-activation interpretation
+    (`scripts/gigatime_testing.ipynb`'s ``pred = (probs > 0.5)``) with a
+    single, fixed normalization.
 
     Pass ``threshold=None`` to use continuous sigmoid probabilities as the
-    blending weights (each channel contributes ``prob[c] * color[c]`` and the
-    pixel is normalized by ``sum(probs)``).
-
-    Background channels TRITC/Cy5 are excluded via EXPORT_CHANNELS.
+    blending weights (``sum(prob[c] * color[c]) / N_EXPORT``).
     """
     if probs23_hw.shape[0] != NUM_CLASSES:
         raise ValueError(f"Expected {NUM_CLASSES} channels, got {probs23_hw.shape[0]}")
@@ -140,17 +136,37 @@ def composite_virtual_mif_rgb_u8(
     sel = probs23_hw[idxs, :, :].astype(np.float32, copy=False)  # (C, H, W)
     if threshold is not None:
         sel = (sel > float(threshold)).astype(np.float32)
+    return composite_mask_rgb_u8(sel, rescale=rescale)
+
+
+def composite_mask_rgb_u8(
+    mask_chw: npt.NDArray[np.floating | np.integer],
+    *,
+    rescale: bool = False,
+) -> npt.NDArray[np.uint8]:
+    """Composite a (C=21, H, W) per-marker mask into an (H, W, 3) RGB blend.
+
+    The input may be a binary uint8 mask (0/255) or a float weight map in
+    [0, 1]; values are normalized to [0, 1] internally. Each marker
+    contributes ``color[c] / C`` (fixed divisor — no per-pixel active-channel
+    counting), so pixel brightness reflects how many markers fire there
+    rather than which one is strongest.
+    """
     pal = get_export_palette()  # (C, 3) in [0, 1]
+    if mask_chw.shape[0] != pal.shape[0]:
+        raise ValueError(
+            f"Mask has {mask_chw.shape[0]} channels but palette has {pal.shape[0]}"
+        )
 
-    weighted_sum = np.einsum("chw,cj->hwj", sel, pal)  # (H, W, 3)
-    total_weight = sel.sum(axis=0)  # (H, W)
-    safe_weight = np.maximum(total_weight, 1e-6)[..., None]
-    rgb = weighted_sum / safe_weight
-    rgb = np.where(total_weight[..., None] > 0, rgb, 0.0)
+    mask_f = mask_chw.astype(np.float32, copy=False)
+    if mask_chw.dtype == np.uint8:
+        mask_f = mask_f / 255.0
 
-    mx = float(rgb.max())
-    if rescale and mx > 1e-6:
-        rgb = rgb / mx
+    rgb = np.einsum("chw,cj->hwj", mask_f, pal) / float(pal.shape[0])
+    if rescale:
+        mx = float(rgb.max())
+        if mx > 1e-6:
+            rgb = rgb / mx
     return (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 

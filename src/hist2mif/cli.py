@@ -21,8 +21,10 @@ def _build_parser() -> argparse.ArgumentParser:
         DEFAULT_CLI_BATCH_SIZE,
         DEFAULT_CLI_NUM_WORKERS,
         MASK_TIF_DOWNSAMPLE,
-        SNAPSHOT_DOWNSAMPLE,
+        SNAPSHOT_OF_MASK_RATIO,
     )
+
+    snapshot_total_downsample = MASK_TIF_DOWNSAMPLE * SNAPSHOT_OF_MASK_RATIO
 
     parser = argparse.ArgumentParser(
         prog="hist2mif-cli",
@@ -48,8 +50,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--snapshot-png",
         type=Path,
         help=(
-            f"1/{SNAPSHOT_DOWNSAMPLE} scale PNG snapshot with marker legend "
-            f"(cv2.INTER_NEAREST per-tile resize; "
+            f"1/{snapshot_total_downsample} scale PNG snapshot with marker legend "
+            f"(composited from the 1/{MASK_TIF_DOWNSAMPLE} mask then resized "
+            f"by 1/{SNAPSHOT_OF_MASK_RATIO} with cv2.INTER_NEAREST; "
             f"default: *_virtual_mIF_snapshot.png)"
         ),
     )
