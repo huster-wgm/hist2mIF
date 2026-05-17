@@ -48,9 +48,9 @@ MASK_TIF_DOWNSAMPLE = 16
 # JPEG quality used for the per-channel mask TIFF pages (libjpeg level).
 OUTPUT_JPEG_QUALITY = 90
 
-# Thumbnail grid layout (4 cols x 6 rows = 24 cells; 21 markers + 3 black).
-THUMBNAIL_GRID_COLS = 4
-THUMBNAIL_GRID_ROWS = 6
+# Thumbnail grid layout (6 cols x 4 rows = 24 cells; 21 markers + 3 black).
+THUMBNAIL_GRID_COLS = 6
+THUMBNAIL_GRID_ROWS = 4
 THUMBNAIL_CELL_WIDTH = 400
 THUMBNAIL_PADDING = 12
 THUMBNAIL_PAD_COLOR: tuple[int, int, int] = (255, 255, 255)
